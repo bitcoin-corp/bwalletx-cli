@@ -26,6 +26,7 @@ import {
   type HelloFrame,
   type PairMessage,
 } from './pair/protocol.js';
+import { inOrder } from './pair/in-order.js';
 import { home, readConfig, readJsonFile, writeConfig, writeJsonFile } from './store.js';
 
 export const CLI_ORIGIN = 'https://cli.bwalletx.com';
@@ -86,7 +87,8 @@ function round(name: string, out: (s: string) => void): Promise<Pairing | null> 
       out(`Or open this link on the phone:\n${link}\n`);
     });
     ws.on('error', (err) => !sealer && (clearTimeout(timer), reject(new Error(`Pairing service unreachable: ${err.message}`))));
-    ws.on('message', async (raw) => {
+    // In order: the phone's ready can arrive while hello is still deriving the key.
+    ws.on('message', inOrder(async (raw: unknown) => {
       const f = JSON.parse(String(raw)) as unknown;
       if ((f as HelloFrame).t === 'hello' && !sealer) {
         clearTimeout(timer);
@@ -140,7 +142,7 @@ function round(name: string, out: (s: string) => void): Promise<Pairing | null> 
         ws.close();
         reject(new Error('Cancelled on the phone.'));
       }
-    });
+    }));
   });
 }
 
@@ -187,7 +189,7 @@ export class PhoneSession {
       this.ws.once('open', () => resolve());
       this.ws.once('error', (e) => reject(new Error(`Pairing service unreachable: ${e.message}`)));
     });
-    this.ws.on('message', (raw) => void this.onFrame(String(raw)));
+    this.ws.on('message', inOrder((raw: unknown) => this.onFrame(String(raw))));
     this.ws.on('close', () => this.failAll(new Error('Connection to the pairing service closed.')));
   }
 
