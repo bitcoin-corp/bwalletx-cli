@@ -113,7 +113,17 @@ export const liveIndexed = async (
   indexed: MineNode,
 ): Promise<(MineNode & { beef?: number[] }) | null> => {
   const head = await followForward(deps.fetch, indexed.outpoint, 8);
-  if (head === indexed.outpoint) return deps.tree?.isSpent(head) ? null : indexed;
+  if (head === indexed.outpoint) {
+    const tree = deps.tree;
+    if (!tree?.isSpent(head)) return indexed;
+    // 24 Oct 2026: "hej"/"hek" waited 90 min and more on "catching up" because the cache marked the live "he" node
+    // spent by a mint that never reached the chain. An old mark on an outpoint WhatsOnChain calls unspent is stale.
+    const at = tree.spentAt(head) ?? Date.now();
+    if (Date.now() - at < GHOST_MS || !(await outpointUnspent(deps.fetch, head))) return null;
+    tree.unmarkSpent(head);
+    deps.log?.(`Node "${indexed.domain}" (${head.slice(0, 12)}…) is unspent on-chain: clearing our stale spent mark`);
+    return indexed;
+  }
   try {
     const node = await (deps.load ?? loadNode)(deps.ctx, head);
     if (node.state.domain !== indexed.domain) return null;
@@ -225,6 +235,13 @@ export const findChildBackwards = async (
 export const isUnknownTx = (msg: string) => /must be valid transaction|unknown tx|not found|404/i.test(msg);
 /** A cached node older than this that the chain doesn't know is a ghost, not lag. */
 export const GHOST_MS = 30 * 60_000;
+
+/** True only on a clear 404 from WhatsOnChain's spent lookup (unspent); errors and 429s are "don't know". */
+export const outpointUnspent = async (f: Fetch, outpoint: string) => {
+  const [txid, vout] = outpoint.split(/[._]/);
+  const r = await f(`${WOC}/tx/${txid}/${vout}/spent`).catch(() => null);
+  return r?.status === 404;
+};
 
 /** True only on a clear 404 from WhatsOnChain (a 429 / network error is "don't know", never "ghost"). */
 export const txMissing = async (f: Fetch, txid: string) => {
