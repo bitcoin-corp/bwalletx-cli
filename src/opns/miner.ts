@@ -15,7 +15,11 @@ export const setThreads = (n: number) => {
 };
 export const getThreads = () => threads;
 
-const WORKER_URL = new URL('./minerWorker.js', import.meta.url);
+let WORKER_URL: URL | string = new URL('./minerWorker.js', import.meta.url);
+/** A single-file build (the PC miner .exe) bundles the worker elsewhere and says where. */
+export const setWorkerUrl = (u: URL | string) => {
+  WORKER_URL = u;
+};
 
 export const threadMine = (
   pow: number[],

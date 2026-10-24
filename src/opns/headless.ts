@@ -27,7 +27,7 @@ import {
 } from './batch.js';
 import { benchmark, getThreads, setThreads } from './miner.js';
 import { estimateMintFee, fetchMineNode } from './opnsMint.js';
-import { mineName } from './opnsRegister.js';
+import { mineName, type Progress } from './opnsRegister.js';
 import { appendLedger, ledgerNames, ownerCheck } from './opnsOwner.js';
 import { fileKV, OpnsTree } from './opnsTree.js';
 import { indexerFetch } from './services.js';
@@ -211,6 +211,8 @@ export type MintOptions = {
   prune?: boolean;
   /** Vault/gift files route only; they add no names (a second machine). */
   listsOnly?: boolean;
+  /** Called on every batch update (the PC miner's local status page). */
+  onProgress?: (s: State, p?: Progress & { name: string }) => void;
 };
 
 export async function opnsMint(o: MintOptions): Promise<RunResult> {
@@ -330,6 +332,7 @@ export async function opnsMint(o: MintOptions): Promise<RunResult> {
           if (tty) process.stdout.write(`\r\x1b[2K${line.slice(0, (process.stdout.columns || 160) - 1)}`);
         },
         onUpdate: (s, p) => {
+          o.onProgress?.(s, p);
           const cur = s.items.find((it) => it.status === 'mining');
           doing = p ? `${p.phase} "${p.name}" (${p.domain || '…'})` : cur ? `"${cur.name}"${cur.note ? `: ${cur.note.slice(0, 100)}` : ''}` : 'between names';
           if (p?.phase === 'mining') lastLog = Date.now(); // hashing is visible progress
