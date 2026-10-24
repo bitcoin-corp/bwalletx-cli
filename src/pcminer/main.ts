@@ -42,7 +42,7 @@ const say = (m: string) => console.log(`${new Date().toTimeString().slice(0, 8)}
 
 const openBrowser = (url: string) => {
   if (noOpen) return;
-  const [cmd, a] = process.platform === 'win32' ? ['cmd', ['/c', 'start', '""', url.replace(/&/g, '^&')]] : process.platform === 'darwin' ? ['open', [url]] : ['xdg-open', [url]];
+  const [cmd, a] = process.platform === 'win32' ? ['rundll32', ['url.dll,FileProtocolHandler', url]] : process.platform === 'darwin' ? ['open', [url]] : ['xdg-open', [url]];
   try {
     spawn(cmd, a, { detached: true, stdio: 'ignore', windowsHide: true }).unref();
   } catch {
