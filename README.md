@@ -113,6 +113,17 @@ and only backs up every 5 minutes, so the two would drift. `brc100 migrate` move
 find it the same way they find BSV Desktop. Built on `@bsv/wallet-toolbox`; keys are decrypted into memory only.
 
 - **Allowlist**: only the hosts given with `--origin` get an answer; everyone else gets 403.
+- **Pairing**: the Origin header proves nothing (any program on the machine can send one), so each allowed
+  site pairs once. The site sends `POST /pair`; serve prints the origin and an 8-digit comparison code in its
+  terminal and asks `y/N`. The response streams `{"code":"1234 5678"` at once (the site shows it so the owner can
+  compare) and finishes with `,"approved":true,"token":"…"}` or `,"approved":false}`. Every other call must
+  carry `Authorization: Bearer <token>`; without a valid token for that origin it gets 401. Only `getVersion` and
+  `isAuthenticated` answer unpaired (a fixed version string and `authenticated: false`), so sites can detect the
+  wallet. Tokens are random per origin and stored only as SHA-256 hashes in `~/.bwalletx/serve-pairings.json`
+  (0600). `bwalletx serve --list-pairings` lists them; `bwalletx serve --revoke <origin>` revokes one at once.
+  Serve without a terminal (no TTY) refuses every pairing request.
+- **Host check**: serve binds to 127.0.0.1 and answers 403 unless the `Host` header is `localhost:<port>` or
+  `127.0.0.1:<port>`, which stops DNS-rebinding pages.
 - **The gate**: every `createAction` is checked like a `send` for the BSV it takes out of the account
   (its outputs minus what the site's own inputs bring in), so the kill switch, daily cap, rate limit and a
   loaded strategy all apply. Refusals reach the site as a readable wallet error.

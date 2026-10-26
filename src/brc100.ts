@@ -24,6 +24,8 @@ import { utxos } from './wallet.js';
 import type { AgentKeys } from './keyfile.js';
 import { repairStaleProofs, type RepairResult } from './opns/proofRepair.js';
 import { syncProofs, type SyncResult } from './opns/proofSync.js';
+import { bearerOf, checkToken, comparisonCode, issueToken } from './servePairing.js';
+import { randomBytes } from 'node:crypto';
 
 /** proven_tx_reqs statuses still waiting for a merkle proof (toolbox TaskCheckForProofs / TaskCheckNoSends). */
 const UNPROVEN = ['callback', 'unmined', 'sending', 'unknown', 'unconfirmed', 'nosend'];
@@ -414,7 +416,15 @@ export type ServeOptions = {
    * is 1 sat however much the token is worth, so these would otherwise slip under every cap.
    */
   allowTokenTransfers?: boolean;
+  /**
+   * Ask the owner to approve a new site: shows the origin and the 8-digit comparison code, resolves y/N.
+   * Without it every pairing request is refused (no site can get a token).
+   */
+  confirmPairing?: (req: { origin: string; code: string }) => Promise<boolean>;
 };
+
+/** Calls a site may make before pairing, so it can detect the wallet. They are answered by serve itself and leak nothing. */
+export const UNAUTHENTICATED = new Set(['getVersion', 'isAuthenticated']);
 
 /**
  * Defaults for automatic payments from sites (24 Oct 2026 audit, after the x402 SDK findings): an account
@@ -465,7 +475,22 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
     res.end(stringifyBRC100(body));
   };
 
+  let port = o.port ?? BRC100_PORT;
+  let prompts: Promise<unknown> = Promise.resolve();
+  const pending = new Map<string, Promise<boolean>>();
+  const askOwner = (host: string, code: string) => {
+    const r = prompts.then(() => (o.confirmPairing ? o.confirmPairing({ origin: host, code }) : false)).catch(() => false);
+    prompts = r;
+    return r;
+  };
+
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
+    // DNS rebinding: a page on evil.example resolving to 127.0.0.1 sends Host: evil.example.
+    const hostHeader = String(req.headers.host ?? '').toLowerCase();
+    if (hostHeader !== `localhost:${port}` && hostHeader !== `127.0.0.1:${port}`) {
+      say(`refused Host ${hostHeader || '(none)'}: not localhost:${port}`);
+      return send(res, 403, refusal('bwalletx serve: bad Host header'));
+    }
     const origin = String(req.headers.origin ?? req.headers.originator ?? '');
     const host = hostOf(origin);
     const ok = host && (allowed.has(host) || allowed.has('*'));
@@ -474,7 +499,7 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
         ...(ok && {
           'Access-Control-Allow-Origin': origin,
           'Access-Control-Allow-Methods': 'POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Accept, Originator',
+          'Access-Control-Allow-Headers': 'Content-Type, Accept, Originator, Authorization',
           'Access-Control-Allow-Private-Network': 'true',
           Vary: 'Origin',
         }),
@@ -486,6 +511,33 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
       return send(res, 403, refusal(`bwalletx serve: ${host || 'this origin'} is not allowed (start with --origin ${host || '<site>'})`));
     }
     const call = (req.url ?? '').replace(/^\/+/, '').split('?')[0];
+    if (call === 'pair' && req.method === 'POST') {
+      // One prompt per origin at a time; a second request while one is open is refused, not queued.
+      if (pending.has(host)) return send(res, 409, refusal('bwalletx serve: a pairing request for this site is already waiting'), origin);
+      const code = comparisonCode(host, randomBytes(16).toString('hex'));
+      say(`pairing request from ${host}, code ${code}`);
+      const p = askOwner(host, code);
+      pending.set(host, p);
+      // The site gets the code first (chunked) so it can show it while the owner decides.
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': origin, Vary: 'Origin' });
+      res.write(`{"code":${JSON.stringify(code)}`);
+      const yes = await p.finally(() => pending.delete(host));
+      if (!yes) {
+        say(`pairing for ${host} refused`);
+        return res.end(',"approved":false}');
+      }
+      const token = issueToken(host);
+      say(`paired ${host}`);
+      return res.end(`,"approved":true,"token":${JSON.stringify(token)}}`);
+    }
+    const authed = checkToken(host, bearerOf(req.headers.authorization));
+    if (!authed) {
+      if (req.method === 'POST' && UNAUTHENTICATED.has(call)) {
+        return send(res, 200, call === 'getVersion' ? { version: 'bwalletx-1.0.0' } : { authenticated: false }, origin);
+      }
+      say(`refused ${host} ${call || '(no call)'}: not paired (no valid token)`);
+      return send(res, 401, refusal('bwalletx serve: this site is not paired; POST /pair and approve it in the serve terminal'), origin);
+    }
     if (req.method !== 'POST' || !ALLOWED.has(call) || NEVER_FORWARD.has(call) || (w.paired && !PAIRED_FORWARD.has(call))) return send(res, 400, refusal(`bwalletx serve: ${call || 'this call'} is not offered`), origin);
 
     const chunks: Buffer[] = [];
@@ -586,6 +638,8 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
     server.once('error', reject);
     server.listen(o.port ?? BRC100_PORT, '127.0.0.1', () => resolve());
   });
+  const addr = server.address();
+  if (addr && typeof addr === 'object') port = addr.port;
   return server;
 }
 

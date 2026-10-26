@@ -17,6 +17,15 @@ process.env.BWALLETX_HOME = dir;
 
 const { writeConfig, writeJsonFile } = await import('./store');
 const { serve, pairedBackend } = await import('./brc100');
+const { issueToken, checkToken } = await import('./servePairing');
+/** Every serve call now needs a pairing token; the tests pair each origin up front. */
+const tokens = new Map<string, string>();
+const authFor = (origin: string) => {
+  const host = new URL(origin).host;
+  let t = tokens.get(host);
+  if (!t || !checkToken(host, t)) tokens.set(host, (t = issueToken(host)));
+  return `Bearer ${t}`;
+};
 const { CLI_ORIGIN } = await import('./paired');
 
 /** Minimal relay: one site + one wallet socket per channel, frames forwarded verbatim (queued if the peer is away). */
@@ -101,7 +110,7 @@ async function setup(mode: 'answer' | 'silent', timeoutMs?: number) {
   cleanups.push(() => fake.close(), () => w.close(), () => new Promise((r) => server.close(r)));
   const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const post = async (method: string, body: unknown, origin = 'https://good.example') => {
-    const r = await fetch(`${url}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin }, body: JSON.stringify(body) });
+    const r = await fetch(`${url}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin, Authorization: authFor(origin) }, body: JSON.stringify(body) });
     return { status: r.status, body: (await r.json()) as Record<string, unknown> };
   };
   return { post, fake, phone, arcCalls };
