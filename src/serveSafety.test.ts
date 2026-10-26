@@ -14,6 +14,15 @@ const dir = mkdtempSync(join(tmpdir(), 'bwx-serve-safety-'));
 process.env.BWALLETX_HOME = dir;
 const { writeConfig } = await import('./store');
 const { serve, isAuthProtocolCall, hasTokenOutputs } = await import('./brc100');
+const { issueToken, checkToken } = await import('./servePairing');
+/** Every serve call now needs a pairing token; the tests pair each origin up front. */
+const tokens = new Map<string, string>();
+const authFor = (origin: string) => {
+  const host = new URL(origin).host;
+  let t = tokens.get(host);
+  if (!t || !checkToken(host, t)) tokens.set(host, (t = issueToken(host)));
+  return `Bearer ${t}`;
+};
 const { DEFAULT_DAILY_CAP_USD, mcpMaxUsdPerCall } = await import('./store');
 
 const lock = new P2PKH().lock(PrivateKey.fromRandom().toAddress()).toHex();
@@ -33,7 +42,7 @@ async function setup(origins: string[], opts: Record<string, unknown> = {}) {
   cleanups.push(() => new Promise((r) => server.close(r)));
   const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const post = async (method: string, body: unknown, origin = `https://${origins[0]}`) => {
-    const r = await fetch(`${url}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin }, body: JSON.stringify(body) });
+    const r = await fetch(`${url}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin, Authorization: authFor(origin) }, body: JSON.stringify(body) });
     return { status: r.status, body: (await r.json()) as Record<string, unknown> };
   };
   return { post, calls };

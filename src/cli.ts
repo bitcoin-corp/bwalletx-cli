@@ -524,15 +524,47 @@ program
   .option('-a, --account <name>', 'agent account')
   .option('--wallet <kind>', 'local (the CLI wallet), shared (1Sat Storage) or paired (forward to your phone: `bwalletx pair --main`)')
   .option('--shared', 'alias for --wallet shared')
-  .requiredOption('-o, --origin <host...>', 'sites allowed to use the wallet, e.g. www.tokenblaster.lol localhost:3000')
+  .option('-o, --origin <host...>', 'sites allowed to use the wallet, e.g. www.tokenblaster.lol localhost:3000 (each must also pair)')
+  .option('--list-pairings', 'list the sites paired with serve, then exit')
+  .option('--revoke <origin>', "revoke a site's pairing token, then exit")
   .option('-p, --port <n>', 'port', '3321')
   .option('--max-usd <n>', 'most one payment from a site may move, in USD', '1')
   .option('--budget-usd <n>', 'most this serve session may move in total, in USD', '5')
   .option('--allow-any-origin', "allow --origin '*' (any web page on this machine)")
   .option('--allow-token-transfers', 'let sites move BSV-21 tokens / ordinals (the USD caps cannot value them)')
   .action(
-    run(async (o: { account?: string; origin: string[]; port: string; shared?: boolean; wallet?: string; maxUsd: string; budgetUsd: string; allowAnyOrigin?: boolean; allowTokenTransfers?: boolean }) => {
-      const limits = { maxUsdPerAction: Number(o.maxUsd), sessionBudgetUsd: Number(o.budgetUsd), allowAnyOrigin: !!o.allowAnyOrigin, allowTokenTransfers: !!o.allowTokenTransfers };
+    run(async (o: { account?: string; origin?: string[]; listPairings?: boolean; revoke?: string; port: string; shared?: boolean; wallet?: string; maxUsd: string; budgetUsd: string; allowAnyOrigin?: boolean; allowTokenTransfers?: boolean }) => {
+      const sp = await import('./servePairing.js');
+      if (o.listPairings) {
+        const all = sp.listPairings();
+        if (!all.length) console.log('No sites paired.');
+        for (const p of all) console.log(`${p.origin}  paired ${new Date(p.createdAt).toISOString()}`);
+        return;
+      }
+      if (o.revoke) {
+        const host = o.revoke.replace(/^https?:\/\//, '').replace(/\/.*$/, '').toLowerCase();
+        console.log(sp.revokePairing(host) ? `Revoked ${host}.` : `${host} was not paired.`);
+        return;
+      }
+      if (!o.origin?.length) throw new Error('serve needs --origin <host...> (or --list-pairings / --revoke <origin>)');
+      const origins = o.origin;
+      const confirmPairing = async ({ origin, code }: { origin: string; code: string }) => {
+        if (!process.stdin.isTTY) {
+          console.log(`Pairing request from ${origin} refused: serve has no terminal to ask in.`);
+          return false;
+        }
+        const { createInterface } = await import('node:readline/promises');
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        try {
+          console.log(`\nPairing request from ${origin}`);
+          console.log(`  code ${code}  (the site must show the same code; if it doesn't, answer N)`);
+          const a = await rl.question('  Let this site use the wallet? [y/N] ');
+          return /^y(es)?$/i.test(a.trim());
+        } finally {
+          rl.close();
+        }
+      };
+      const limits = { maxUsdPerAction: Number(o.maxUsd), sessionBudgetUsd: Number(o.budgetUsd), allowAnyOrigin: !!o.allowAnyOrigin, allowTokenTransfers: !!o.allowTokenTransfers, confirmPairing };
       if (!(limits.maxUsdPerAction >= 0) || !(limits.sessionBudgetUsd >= 0)) throw new Error('--max-usd and --budget-usd must be numbers >= 0');
       const kind = o.wallet ?? (o.shared ? 'shared' : 'local');
       if (!['local', 'shared', 'paired'].includes(kind)) throw new Error(`--wallet must be local, shared or paired (got "${kind}")`);
@@ -546,9 +578,9 @@ program
         if (p.mode !== 'brc100') throw new Error(`"${n}" is an agent pairing, not a main-wallet one. Run \`bwalletx pair --main\`.`);
         const b = await import('./brc100.js');
         const w = await b.pairedBackend(n);
-        await b.serve(w, { account: n, origins: o.origin, port: Number(o.port), onEvent: log, ...limits });
+        await b.serve(w, { account: n, origins, port: Number(o.port), onEvent: log, ...limits });
         console.log(`Your paired bWalletX (${p.account}) is a BRC-100 wallet on http://localhost:${o.port}`);
-        console.log(`  allowed: ${o.origin.join(', ')}`);
+        console.log(`  allowed: ${origins.join(', ')} (each site pairs once: approve it here; revoke with --revoke <origin>)`);
         console.log('  keys stay on the phone: keep bWalletX open and unlocked; it approves every spend. No local fallback. Ctrl-C to stop.');
         await new Promise<void>((resolve) => process.once('SIGINT', () => resolve()));
         await w.close();
@@ -557,11 +589,11 @@ program
       const { name, b, w } = await brc100Account(o.account, kind === 'shared');
       w.startMonitor();
       const sats = await b.walletBalance(w).catch(() => 0);
-      await b.serve(w, { account: name, origins: o.origin, port: Number(o.port), onEvent: (l) => console.log(`${new Date().toLocaleTimeString()}  ${l}`), ...limits });
+      await b.serve(w, { account: name, origins, port: Number(o.port), onEvent: (l) => console.log(`${new Date().toLocaleTimeString()}  ${l}`), ...limits });
       console.log(`bWalletX agent "${name}" is a BRC-100 wallet on http://localhost:${o.port}`);
       console.log(`  identity key ${w.identityKey}`);
       console.log(`  balance ${sats.toLocaleString()} sats${sats ? '' : ' (run `bwalletx brc100 fund` to move the pay address in)'}`);
-      console.log(`  allowed: ${o.origin.join(', ')}`);
+      console.log(`  allowed: ${origins.join(', ')} (each site pairs once: approve it here; revoke with --revoke <origin>)`);
       console.log('  every spend passes the kill switch, daily cap and rate limit; `bwalletx stop` refuses all. Ctrl-C to stop.');
       await new Promise<void>((resolve) => process.once('SIGINT', () => resolve()));
       await w.close();
