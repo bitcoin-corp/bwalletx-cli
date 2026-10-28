@@ -260,6 +260,9 @@ accounts need `BWALLETX_PASSPHRASE` in the MCP env, paired accounts sign on the 
 | `unlist` | cancel one of the account's listings (`dryRun` builds only) |
 | `listings` | the account's open listings with price and live status |
 | `buy_listing` | buy one listing by outpoint, like `buy-listing` (+1% market fee; gated as `buy`; optional `maxUsd`; `dryRun` builds only) |
+| `list_products` | bWalletX Store products agents can buy ($1 themes, $99/year Theme edition, Branded edition from $999 by quote) |
+| `quote` | signed 5-minute single-use quote: USD, sats at the live rate, MNEE amount (nothing paid) |
+| `buy_product` | quote → check → gate → pay from the BRC-100 wallet → server verifies + broadcasts → granted to this identity key (gated like `send`; `maxUsd`; `dryRun` builds only; API: `BWALLETX_STORE_API`, default https://pay.bwallet.space) |
 | `strategy_show` | the loaded strategy, mode and paper book |
 | `strategy_load` | load a strategy file, always in **paper** mode |
 | `log` | recent activity log entries |
