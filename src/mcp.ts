@@ -228,12 +228,11 @@ export async function runMcp(version: string) {
     'buy_product',
     {
       description:
-        'Buy a Store product from the account\'s BRC-100 wallet: quote → check (price within maxUsd, sats match our BSV rate) → gate → the server checks the payment and broadcasts → granted to this identity key, with a Store receipt. Gated like send: per-call limit (BWALLETX_MCP_MAX_USD, default $5, so the $99 edition needs it raised), kill switch, daily cap, rate limit, strategy rules; paper mode refuses. dryRun quotes and builds only. Named buy_product because `buy` is the BSV-21 token buy.',
+        'Buy a Store product from the account\'s BRC-100 wallet: quote → check (price within maxUsd, sats match our BSV rate) → gate → the server checks the payment and broadcasts → granted to this identity key, with a Store receipt. Not subject to the BWALLETX_MCP_MAX_USD per-call limit (these are bWalletX\'s own products); still gated by the kill switch, daily cap, rate limit, strategy rules; paper mode refuses. dryRun quotes and builds only. Named buy_product because `buy` is the BSV-21 token buy.',
       inputSchema: { product, fields: productFields, maxUsd: z.number().positive(), account, dryRun },
     },
     wrap(async (o: { product: storeBuy.Product; fields?: Record<string, unknown>; maxUsd: number; account?: string; dryRun?: boolean }) => {
-      const max = mcpMaxUsdPerCall();
-      if (o.maxUsd > max + 1e-9) return { ok: false, text: `Refused: $${o.maxUsd} is over the $${max} per-call limit for MCP spends (BWALLETX_MCP_MAX_USD)` };
+      // Our own Store products: no BWALLETX_MCP_MAX_USD per-call cap. The quote check (maxUsd, our BSV rate) still applies.
       return needPass(o.dryRun) ?? storeBuy.buy(o);
     }),
   );
