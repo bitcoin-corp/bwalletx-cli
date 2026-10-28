@@ -454,6 +454,50 @@ export const isAuthProtocolCall = (call: string, args: unknown) => {
   return Array.isArray(p) && typeof p[1] === 'string' && AUTH_PROTOCOLS.has(p[1].trim().toLowerCase());
 };
 
+/**
+ * "Sign in with bWalletX" protocols (b-Aware 28 Oct 2026, hilmiadi677 H-1). Their keys are per protocol, not per
+ * site, so with several sites allowed one paired site could ask for a sign-in signature over ANOTHER site's
+ * challenge and replay it there. A sign-in is signed only when its text names the requesting origin and no other.
+ */
+const SIGN_IN_PROTOCOLS = new Set(['bwallet sign in', 'bwalletx access']);
+export const isSignInCall = (call: string, args: unknown) => {
+  if (!['createSignature', 'createHmac'].includes(call)) return false;
+  const p = (args as { protocolID?: unknown } | null)?.protocolID;
+  return Array.isArray(p) && typeof p[1] === 'string' && SIGN_IN_PROTOCOLS.has(p[1].trim().toLowerCase());
+};
+
+const originOf = (v: string) => {
+  try {
+    return new URL(v).origin.toLowerCase();
+  } catch {
+    return null;
+  }
+};
+
+/** Why this sign-in must not be signed for `requestOrigin`, or null. Fails closed on anything it can't read. */
+export const signInBindingRefusal = (args: unknown, requestOrigin: string): string | null => {
+  const a = (args ?? {}) as { data?: unknown; hashToDirectlySign?: unknown };
+  if (a.hashToDirectlySign !== undefined) return 'a sign-in must sign its text, not a hash';
+  const d = a.data;
+  if (!Array.isArray(d) || !d.length || d.length > 64 * 1024 || !d.every((b) => Number.isInteger(b) && b >= 0 && b <= 255))
+    return 'the sign-in text could not be read';
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(d as number[]));
+  } catch {
+    return 'the sign-in text could not be read';
+  }
+  const want = originOf(requestOrigin);
+  if (!want) return 'the requesting site has no origin';
+  const wantHost = new URL(want).host;
+  const origins = [...text.matchAll(/^\s*origin:\s*(\S+)\s*$/gim)].map((m) => originOf(m[1]));
+  const hosts = [...text.matchAll(/\bsign ?in to (\S+)/gi)].map((m) => m[1].toLowerCase());
+  if (!origins.length) return `the sign-in text does not name ${want}`;
+  if (origins.some((o) => o !== want) || hosts.some((h) => h !== wantHost))
+    return `this sign-in is for another site, not ${want}`;
+  return null;
+};
+
 /** Serve a wallet over the BRC-100 HTTP JSON substrate. Resolves once listening. */
 export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
   const w: ServeWallet = 'call' in input ? input : localBackend(input);
@@ -566,6 +610,13 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
 
   const run = async (res: ServerResponse, call: string, args: Record<string, unknown>, host: string, origin: string) => {
     let sats = 0;
+    if (isSignInCall(call, args)) {
+      const why = signInBindingRefusal(args, origin);
+      if (why) {
+        say(`refused ${host} ${call}: ${why}`);
+        return send(res, 400, refusal(`bwalletx serve: ${why}`), origin);
+      }
+    }
     if (isAuthProtocolCall(call, args) && !singleSite) {
       say(`refused ${host} ${call}: login signatures need serve to allow exactly one site`);
       return send(res, 400, refusal('bwalletx serve: login (BRC-103) signatures are only made when one site is allowed; restart with a single --origin'), origin);
