@@ -87,6 +87,32 @@ describe('serve payment safety', () => {
     expect(isAuthProtocolCall('verifySignature', { protocolID: [2, 'auth message signature'] })).toBe(false);
   });
 
+  // b-Aware 28 Oct 2026 (hilmiadi677, H-1): with several sites, one paired site got a sign-in signature for another.
+  it('signs a "Sign in with bWalletX" message only for the site asking', async () => {
+    const msg = (origin: string) =>
+      [`Sign in to ${new URL(origin).host} with bWallet`, '', 'This proves you hold this wallet. It does not spend anything.', '', `Origin: ${origin}`, 'Nonce: abcdefgh12', 'Expires: 2099-01-01T00:00:00.000Z'].join('\n');
+    const signIn = (origin: string, protocol = 'bwallet sign in') => ({
+      protocolID: [2, protocol],
+      keyID: 'abcdefgh12',
+      counterparty: 'anyone',
+      data: Array.from(Buffer.from(msg(origin), 'utf8')),
+    });
+    const two = await setup(['a.example', 'b.example']);
+    // a.example asks for b.example's challenge: refused, nothing reaches the wallet.
+    for (const protocol of ['bwallet sign in', 'bwalletx access']) {
+      const r = await two.post('createSignature', signIn('https://b.example', protocol), 'https://a.example');
+      expect(r.status).toBe(400);
+      expect(String(r.body.message)).toMatch(/another site/);
+    }
+    // A message that names no origin, or a bare hash, is refused too.
+    expect((await two.post('createSignature', { ...signIn('https://a.example'), data: [104, 105] }, 'https://a.example')).status).toBe(400);
+    expect((await two.post('createSignature', { protocolID: [2, 'bwallet sign in'], keyID: 'abcdefgh12', counterparty: 'anyone', hashToDirectlySign: [1] }, 'https://a.example')).status).toBe(400);
+    expect(two.calls).toEqual([]);
+    // Its own challenge is signed.
+    expect((await two.post('createSignature', signIn('https://a.example'), 'https://a.example')).status).toBe(200);
+    expect(two.calls).toEqual(['createSignature']);
+  });
+
   it('refuses token moves (inscribed outputs or the wallet\'s own named inputs) unless allowed', async () => {
     const insc = '0063036f726451' + Buffer.from('application/bsv-20').toString('hex') + '00' + Buffer.from('{"p":"bsv-20","op":"transfer","id":"x_0","amt":"1000"}').toString('hex') + '68' + lock;
     const tokenPay = { description: 'pay in tokens', outputs: [{ lockingScript: insc, satoshis: 1, outputDescription: 'tokens' }] };
