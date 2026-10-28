@@ -13,6 +13,7 @@ import * as act from './actions.js';
 import * as b1 from './brc100Actions.js';
 import * as mint from './mint.js';
 import * as sell from './sell.js';
+import * as storeBuy from './storeBuy.js';
 import { allStopped, appendLog, getLoaded, mcpMaxUsdPerCall, readConfig, resolveAccount, setAllStopped } from './store.js';
 
 const json = (v: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(v, null, 2) }] });
@@ -206,6 +207,34 @@ export async function runMcp(version: string) {
       const progressPath = mint.progressPathFor(o.manifest);
       const r = await mint.runMint(mint.readManifest(o.manifest), { account: o.account, collection: mint.collectionOf(o), description: o.description, dryRun: o.dryRun, progressPath, out: () => {} });
       return o.dryRun ? r : { ...r, progressPath };
+    }),
+  );
+  const product = z.enum(['theme', 'edition', 'branded']).describe('theme ($1), edition ($99/year) or branded (deposit; from $999 by quote)');
+  const productFields = z.record(z.string(), z.unknown()).optional().describe('The product\'s own fields from list_products (quote_fields), e.g. { pack: "vexvoid" }');
+  server.registerTool(
+    'list_products',
+    { description: 'bWalletX Store products agents can buy: $1 themes (VexVoid, NPG, NPGX, emoji…), the Theme edition ($99/year) and the Branded edition (from $999, by quote: buying pays the deposit with a brief). Read-only.' },
+    wrap(() => storeBuy.listProducts()),
+  );
+  server.registerTool(
+    'quote',
+    {
+      description: 'A signed 5-minute, single-use quote for a Store product: USD, sats at the live BSV rate and the MNEE amount. Nothing is paid. Opens the account\'s BRC-100 wallet to sign (needs BWALLETX_PASSPHRASE; paired accounts are refused).',
+      inputSchema: { product, fields: productFields, account },
+    },
+    wrap(async (o: { product: storeBuy.Product; fields?: Record<string, unknown>; account?: string }) => needPass() ?? storeBuy.quote(o)),
+  );
+  server.registerTool(
+    'buy_product',
+    {
+      description:
+        'Buy a Store product from the account\'s BRC-100 wallet: quote → check (price within maxUsd, sats match our BSV rate) → gate → the server checks the payment and broadcasts → granted to this identity key, with a Store receipt. Gated like send: per-call limit (BWALLETX_MCP_MAX_USD, default $5, so the $99 edition needs it raised), kill switch, daily cap, rate limit, strategy rules; paper mode refuses. dryRun quotes and builds only. Named buy_product because `buy` is the BSV-21 token buy.',
+      inputSchema: { product, fields: productFields, maxUsd: z.number().positive(), account, dryRun },
+    },
+    wrap(async (o: { product: storeBuy.Product; fields?: Record<string, unknown>; maxUsd: number; account?: string; dryRun?: boolean }) => {
+      const max = mcpMaxUsdPerCall();
+      if (o.maxUsd > max + 1e-9) return { ok: false, text: `Refused: $${o.maxUsd} is over the $${max} per-call limit for MCP spends (BWALLETX_MCP_MAX_USD)` };
+      return needPass(o.dryRun) ?? storeBuy.buy(o);
     }),
   );
   server.registerTool(
