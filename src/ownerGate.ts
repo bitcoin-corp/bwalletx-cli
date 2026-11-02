@@ -13,11 +13,29 @@
  * an agent that has a shell AND your PIN AND fakes a terminal, and a key-file account's keys are only as safe as
  * BWALLETX_PASSPHRASE (which an agent that can read your MCP config can read). For large spends the real control
  * is approve-above on a paired account: the phone approves, and nothing in this file can approve a spend.
+ *
+ * 0.7.0: on a Mac, step 4 is Touch ID or the Mac password instead of a PIN (hardwareOwner.ts). The owner key is
+ * a Secure Enclave key that refuses to sign without the prompt, and a Keychain anchor says which key is the owner,
+ * so faking a terminal, unsetting CLAUDECODE or deleting ~/.bwalletx/owner*.json no longer gets an agent an owner
+ * of its own. Elsewhere (Linux, CI) the PIN stays, and `owner status` says the gate is software-only.
  */
 import { decryptKeyFile, validateKeyFile } from './keyfile.js';
+import { randomBytes } from 'node:crypto';
+import { rmSync } from 'node:fs';
+import { hardwareStore, type HardwareOwnerStore, type HwAnchor, type HwSigner } from './hardwareOwner.js';
 import {
   bodyOf,
   createOwner,
+  hwOwnerFile,
+  ownerPath,
+  pinSigner,
+  PRESENCE_DOMAIN,
+  readHwOwnerFile,
+  settingsPath,
+  verifyOwnerSig,
+  writeSignedSettings,
+  type OwnerSigner,
+  type SettingsFile,
   effectiveAccount,
   hashLoaded,
   pinProblem,
@@ -40,7 +58,6 @@ import { DEFAULT_DAILY_CAP_USD, RATE_LIMIT_PER_HOUR } from './limits.js';
 import { confirm as ttyConfirm, hiddenPrompt } from './passphrase.js';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import type { KeyObject } from 'node:crypto';
 import { allStopped, appendLog, getLoaded, home, readConfig, readKeyFile, resolveAccount, setAllStopped, updateAccount, type AccountConfig } from './store.js';
 
 export type OwnerEnv = {
@@ -113,18 +130,30 @@ const restrictiveFromConfig = (a: AccountConfig | undefined, stopped = false): S
 
 export type BaseSource = 'signed' | 'recovered' | 'defaults';
 
-/** Holds the owner key in memory for one command. Only made by requireOwner / setupOwner. */
+/** A stopped body (signature dropped by `stop`) for this owner key, with stopAll kept on. Unverified: see resumeAll. */
+const stoppedBody = (s: SettingsFile | null, publicKey: string): SettingsBody | null =>
+  s && !s.sig && s.broken && s.publicKey === publicKey ? { ...structuredClone(bodyOf(s)), stopAll: true } : null;
+
+/** Holds an owner signer for one command (the PIN key in memory, or a Touch ID session). Only made by requireOwner / setupOwner. */
 export class OwnerSession {
-  constructor(
-    private readonly priv: KeyObject,
-    readonly publicKey: string,
-  ) {}
+  /** Hardware owner only: the owner looked at the values from before a `stop` and chose to keep them (resumeAll). */
+  acceptStopped = false;
+  constructor(private readonly signer: OwnerSigner) {}
+
+  get publicKey() {
+    return this.signer.publicKey;
+  }
+  get kind() {
+    return this.signer.kind;
+  }
 
   /** What to build the next signed settings on: the verified record, the record from before a `stop`, or safe defaults. */
   base(st: OwnerState = readOwnerState()): { body: SettingsBody; source: BaseSource } {
     if (st.state === 'ok' && st.settings.publicKey === this.publicKey) return { body: structuredClone(bodyOf(st.settings)), source: 'signed' };
     const settings = st.state === 'tampered' ? st.settings : null;
-    const rec = recoverAfterStop(settings, this.priv, this.publicKey);
+    // PIN owner: Ed25519 is deterministic, so re-signing proves the values are the ones signed before the stop.
+    // Hardware owner: ECDSA isn't, so only the owner's explicit OK (acceptStopped) keeps them.
+    const rec = this.signer.priv ? recoverAfterStop(settings, this.signer.priv, this.publicKey) : this.acceptStopped ? stoppedBody(settings, this.publicKey) : null;
     if (rec) return { body: structuredClone(rec), source: 'recovered' };
     const cfg = readConfig();
     const accounts: Record<string, SignedAccount> = {};
@@ -136,20 +165,59 @@ export class OwnerSession {
   }
 
   /** Sign and save the next settings. Returns where the base came from. */
-  update(mut: (b: SettingsBody) => void): BaseSource {
+  async update(mut: (b: SettingsBody) => void): Promise<BaseSource> {
     const { body, source } = this.base();
     mut(body);
     body.seq += 1;
     body.signedAt = Date.now();
     body.publicKey = this.publicKey;
-    writeSettings(body, this.priv);
+    await writeSignedSettings(body, this.signer);
     return source;
+  }
+
+  /** Ends a Touch ID session (the PIN key just goes out of scope). */
+  close() {
+    this.signer.close?.();
   }
 
   /** The account entry in a body, created from config.json (restrictive) when missing. */
   static entry(b: SettingsBody, name: string): SignedAccount {
     return (b.accounts[name] ??= restrictiveFromConfig(readConfig().accounts[name]));
   }
+}
+
+export const SOFTWARE_ONLY_WARNING =
+  'The owner gate on this machine is software-only (a PIN typed at a terminal). An AI agent with a shell can fake a terminal, so if it learns your PIN, or sets one before you do, it can loosen your limits. For large spends use approve-above on a paired phone account (the phone approves).';
+
+/** The anchor, or a refusal when the Keychain can't be read (never assume "no owner" when unsure). */
+function readAnchorOrRefuse(hw: HardwareOwnerStore): HwAnchor | null {
+  try {
+    return hw.readAnchor();
+  } catch (e) {
+    throw new OwnerRefused(`Refused: ${e instanceof Error ? e.message : String(e)}. bwalletx can't tell whether a Touch ID owner exists, so nothing is loosened.`);
+  }
+}
+
+/**
+ * One presence prompt (Touch ID / Mac password), then proof: the key signs a fresh challenge and we check it against
+ * the anchor's public key. A helper that only says "yes" proves nothing; only the Enclave key can make that signature.
+ */
+async function presenceSigner(hw: HardwareOwnerStore, anchor: HwAnchor, what: string, env: OwnerEnv): Promise<OwnerSigner> {
+  env.say(`Confirm with ${hw.prompt} to ${what}.`);
+  let session: HwSigner;
+  try {
+    session = await hw.open(anchor, what);
+  } catch (e) {
+    throw new OwnerRefused(`Not approved (${e instanceof Error ? e.message : String(e)}). Nothing changed.`);
+  }
+  const challenge = Buffer.concat([Buffer.from(`${PRESENCE_DOMAIN}${what}\n`), randomBytes(32)]);
+  try {
+    if (!verifyOwnerSig(challenge, await session.sign(challenge), anchor.publicKey)) throw new Error('its signature did not verify');
+  } catch (e) {
+    session.close();
+    throw new OwnerRefused(`The owner key did not prove the owner is here (${e instanceof Error ? e.message : String(e)}). Nothing changed.`);
+  }
+  return { publicKey: anchor.publicKey, kind: 'hardware', sign: (m) => session.sign(m), close: () => session.close() };
 }
 
 /** Refuse a PIN that opens one of the account key files (it would be the MCP passphrase). */
@@ -202,48 +270,101 @@ async function newPin(env: OwnerEnv): Promise<string> {
   return pin;
 }
 
+/** A first signed baseline for a new owner key. */
+async function signBaseline(env: OwnerEnv, signer: OwnerSigner, st: OwnerState) {
+  const { approved, accounts } = await reviewConfig(env, 'Approve these settings as the owner? (No = safe defaults: $10/day cap, 30/hour, strategies on paper)');
+  await writeSignedSettings(
+    {
+      format: SETTINGS_FORMAT,
+      publicKey: signer.publicKey,
+      seq: (st.state === 'tampered' ? (st.settings?.seq ?? 0) : 0) + 1,
+      signedAt: Date.now(),
+      stopAll: stopFileExists(),
+      accounts,
+    },
+    signer,
+  );
+  return approved;
+}
+
+/** Hardware setup: new Enclave key, one presence prompt, then the anchor, owner.json and a signed baseline. */
+async function setupHardware(hw: HardwareOwnerStore, st: OwnerState, env: OwnerEnv): Promise<OwnerSession> {
+  const anchor = await hw.generate();
+  const signer = await presenceSigner(hw, anchor, 'set up the bwalletx owner', env);
+  try {
+    hw.saveAnchor(anchor);
+    writeOwnerFile(hwOwnerFile(anchor, hw.kind));
+    const approved = await signBaseline(env, signer, st);
+    logAll('owner-setup', `Owner set up with ${hw.prompt}; settings signed (${approved ? 'as configured' : 'safe defaults'})`);
+    env.say(`Owner set up. Loosening a safety setting now needs ${hw.prompt}. Settings signed ${approved ? 'as configured' : 'at the safe defaults'}.`);
+  } catch (e) {
+    signer.close?.();
+    throw e;
+  }
+  return new OwnerSession(signer);
+}
+
 /**
- * First-time setup (or after the owner files were lost): set the PIN and sign a baseline.
- * Refused when a valid PIN already exists (use `owner change`).
+ * First-time setup (or after the owner files were lost). On a Mac with a Secure Enclave the owner is a Touch ID key
+ * and there is no PIN; elsewhere it's the 0.6.0 PIN. Refused when an owner already exists, including a Touch ID key
+ * in the Keychain whose owner files were deleted.
  */
 export async function setupOwner(env: OwnerEnv = defaultOwnerEnv()): Promise<OwnerSession> {
-  assertHuman('set the owner PIN', env);
-  if (readOwnerFile()) throw new OwnerRefused('An owner PIN is already set. Change it with `bwalletx owner change`.');
+  assertHuman('set up the owner', env);
+  const hw = hardwareStore();
+  if (hw && readAnchorOrRefuse(hw))
+    throw new OwnerRefused(
+      'Refused: a Touch ID owner key is already in the macOS Keychain, so setup is refused, even if ~/.bwalletx/owner*.json are gone (that only keeps everything stopped). `bwalletx resume` or `bwalletx owner sign` (Touch ID) restores the settings; `bwalletx owner reset` (Touch ID) removes the key to start over.',
+    );
+  if (readOwnerFile()) throw new OwnerRefused(`An owner PIN is already set. Change it with \`bwalletx owner change\`${hw ? ', or move it to Touch ID with `bwalletx owner upgrade`' : ''}.`);
   const st = readOwnerState();
   if (st.state === 'tampered')
-    env.say(`WARNING: the owner files can't be verified (${st.why}). If you didn't do this, something edited ~/.bwalletx. A new PIN replaces them.`);
+    env.say(`WARNING: the owner files can't be verified (${st.why}). If you didn't do this, something edited ~/.bwalletx. A new owner replaces them.`);
+  if (hw) {
+    env.say(`Setting up the owner with ${hw.prompt}. bwalletx first builds a small helper with Apple's swiftc (a few seconds).`);
+    const avail = await hw.available();
+    if (avail.ok) return setupHardware(hw, st, env);
+    // Only a definite "no Secure Enclave" falls back to a PIN. Anything else (no swiftc, a failed build) could be
+    // caused by an agent, and a PIN it could then set itself is exactly the hole this closes.
+    if (!avail.noHardware)
+      throw new OwnerRefused(`Refused: this Mac can't make a Touch ID owner key right now (${avail.why}). bwalletx doesn't fall back to a PIN on a Mac. Until then every account runs at the safe defaults.`);
+    env.say(`This Mac has no Secure Enclave, so the owner is a PIN. ${SOFTWARE_ONLY_WARNING}`);
+  } else env.say(`WARNING: ${SOFTWARE_ONLY_WARNING}`);
   env.say('Set your owner PIN. bwalletx asks for it, at a hidden prompt, whenever a safety setting is loosened.');
   const pin = await newPin(env);
   const { file, priv } = createOwner(pin, env.scrypt);
   writeOwnerFile(file);
-  const session = new OwnerSession(priv, file.publicKey);
-  const { approved, accounts } = await reviewConfig(env, 'Approve these settings as the owner? (No = safe defaults: $10/day cap, 30/hour, strategies on paper)');
-  const body: SettingsBody = {
-    format: SETTINGS_FORMAT,
-    publicKey: file.publicKey,
-    seq: (st.state === 'tampered' ? (st.settings?.seq ?? 0) : 0) + 1,
-    signedAt: Date.now(),
-    stopAll: stopFileExists(),
-    accounts,
-  };
-  writeSettings(body, priv);
+  const signer = pinSigner(priv, file.publicKey);
+  const approved = await signBaseline(env, signer, st);
   logAll('owner-setup', `Owner PIN set; settings signed (${approved ? 'as configured' : 'safe defaults'})`);
   env.say(`Owner PIN set. Settings signed ${approved ? 'as configured' : 'at the safe defaults'}.`);
-  return session;
+  return new OwnerSession(signer);
 }
 
-/** Checks 1–4 for a loosening action. Offers first-time setup when no PIN exists yet. */
+/** Checks 1–4 for a loosening action. Offers first-time setup when no owner exists yet. */
 export async function requireOwner(what: string, env: OwnerEnv = defaultOwnerEnv()): Promise<OwnerSession> {
   assertHuman(what, env);
+  const hw = hardwareStore();
+  const anchor = hw ? readAnchorOrRefuse(hw) : null;
+  if (hw && anchor) {
+    const signer = await presenceSigner(hw, anchor, what, env);
+    // owner.json only mirrors the anchor. The owner just proved presence, so put it back if it was deleted or swapped.
+    if (readHwOwnerFile()?.publicKey !== anchor.publicKey) writeOwnerFile(hwOwnerFile(anchor, hw.kind));
+    return new OwnerSession(signer);
+  }
+  if (readHwOwnerFile()) {
+    env.say(`"${what}" needs the owner, and the Touch ID owner key is gone from the Keychain. Set up a new owner first.`);
+    return setupOwner(env);
+  }
   const owner = readOwnerFile();
   if (!owner) {
-    env.say(`"${what}" needs the owner PIN, and none is set yet.`);
+    env.say(`"${what}" needs the owner, and none is set up yet.`);
     return setupOwner(env);
   }
   const pin = await env.prompt(`Owner PIN to ${what}: `);
   const k = pin ? unlockOwner(pin, owner) : null;
   if (!k) throw new OwnerRefused('Wrong owner PIN. Nothing changed.');
-  return new OwnerSession(k.priv, k.publicKey);
+  return new OwnerSession(pinSigner(k.priv, k.publicKey));
 }
 
 const say = (env: OwnerEnv, source: BaseSource) => {
@@ -266,7 +387,8 @@ export async function setCap(name: string, v: string, env: OwnerEnv = defaultOwn
   }
   const s = await requireOwner(cap === null ? `clear ${a.name}'s daily cap` : `raise ${a.name}'s daily cap to $${cap}`, env);
   updateAccount(a.name, { dailyCapUsd: cap });
-  say(env, s.update((b) => void (OwnerSession.entry(b, a.name).dailyCapUsd = cap)));
+  say(env, await s.update((b) => void (OwnerSession.entry(b, a.name).dailyCapUsd = cap)));
+  s.close();
   logOne(a.name, 'cap', cap === null ? 'Daily cap cleared (owner PIN)' : `Daily cap raised to $${cap} (owner PIN)`);
   return cap === null ? `${a.name}: no daily cap` : `${a.name}: daily cap $${cap}`;
 }
@@ -285,7 +407,8 @@ export async function setRateLimit(name: string, v: string, env: OwnerEnv = defa
   }
   const s = await requireOwner(n === 0 ? `turn off ${a.name}'s rate limit` : `raise ${a.name}'s rate limit to ${n ?? RATE_LIMIT_PER_HOUR}/hour`, env);
   updateAccount(a.name, { ratePerHour: n });
-  say(env, s.update((b) => void (OwnerSession.entry(b, a.name).ratePerHour = n)));
+  say(env, await s.update((b) => void (OwnerSession.entry(b, a.name).ratePerHour = n)));
+  s.close();
   logOne(a.name, 'ratelimit', `${msg} (owner PIN)`);
   return msg;
 }
@@ -304,7 +427,8 @@ export async function setApproveAbove(name: string, v: string, env: OwnerEnv = d
   }
   const s = await requireOwner(t === null ? `clear ${a.name}'s approval threshold` : `raise ${a.name}'s approval threshold to $${t}`, env);
   updateAccount(a.name, { approveAboveUsd: t });
-  say(env, s.update((b) => void (OwnerSession.entry(b, a.name).approveAboveUsd = t)));
+  say(env, await s.update((b) => void (OwnerSession.entry(b, a.name).approveAboveUsd = t)));
+  s.close();
   logOne(a.name, 'approve-above', `${msg} (owner PIN)`);
   return msg;
 }
@@ -326,12 +450,23 @@ export function lowerCap(name: string, usd: number): string {
   return `${a.name}: daily cap $${usd}`;
 }
 
-/** `bwalletx resume`: owner PIN. Re-signs with stopAll false, then removes the STOP file. */
+/** `bwalletx resume`: owner PIN / Touch ID. Re-signs with stopAll false, then removes the STOP file. */
 export async function resumeAll(env: OwnerEnv = defaultOwnerEnv()): Promise<string> {
   const s = await requireOwner('resume all agents', env);
-  const source = s.update((b) => {
+  if (s.kind === 'hardware') {
+    // A stop drops the signature. A PIN owner's values are proved by re-signing; a Touch ID owner looks and decides.
+    const st = readOwnerState();
+    const body = st.state === 'tampered' ? stoppedBody(st.settings, s.publicKey) : null;
+    if (body) {
+      env.say('Limits from before the stop (a stop removes the signature, so check nothing was raised since):');
+      for (const [n, a] of Object.entries(body.accounts)) env.say(`  ${n}: ${describe(a, a.liveStrategy ? 'approved' : null)}`);
+      s.acceptStopped = await env.confirm('Resume with these limits? (No = safe defaults: $10/day cap, 30/hour, strategies on paper)');
+    }
+  }
+  const source = await s.update((b) => {
     b.stopAll = false;
   });
+  s.close();
   setAllStopped(false);
   say(env, source);
   logAll('resume', 'All agents resumed (owner PIN)');
@@ -339,34 +474,37 @@ export async function resumeAll(env: OwnerEnv = defaultOwnerEnv()): Promise<stri
 }
 
 /** After `strategy load --live` wrote the file: sign exactly that file for that account. */
-export function approveLiveStrategy(s: OwnerSession, name: string, env: OwnerEnv = defaultOwnerEnv()) {
+export async function approveLiveStrategy(s: OwnerSession, name: string, env: OwnerEnv = defaultOwnerEnv()) {
   const l = getLoaded(name);
   if (!l || l.mode !== 'live') throw new Error(`No live strategy loaded for ${name}`);
-  say(env, s.update((b) => void (OwnerSession.entry(b, name).liveStrategy = hashLoaded(l))));
+  say(env, await s.update((b) => void (OwnerSession.entry(b, name).liveStrategy = hashLoaded(l))));
 }
 
 /** After key import / login / pair: make sure the account has a signed entry (its config values, which are new-account defaults). */
-export function approveNewAccount(s: OwnerSession, name: string, env: OwnerEnv = defaultOwnerEnv()) {
+export async function approveNewAccount(s: OwnerSession, name: string, env: OwnerEnv = defaultOwnerEnv()) {
   const a = readConfig().accounts[name];
   if (!a) return;
-  say(env, s.update((b) => void (b.accounts[name] ??= { ...accountFromConfig(a), liveStrategy: null })));
+  say(env, await s.update((b) => void (b.accounts[name] ??= { ...accountFromConfig(a), liveStrategy: null })));
 }
 
 /** `bwalletx owner sign`: review config.json and sign it as the new ceiling. Keeps a stop in place. */
 export async function ownerSign(env: OwnerEnv = defaultOwnerEnv()): Promise<string> {
   const s = await requireOwner('approve the settings in config.json', env);
   const { approved, accounts } = await reviewConfig(env, 'Sign these settings as the owner?');
-  if (!approved) return 'Nothing signed.';
-  s.update((b) => {
+  if (!approved) return (s.close(), 'Nothing signed.');
+  await s.update((b) => {
     b.accounts = accounts;
     b.stopAll = b.stopAll || stopFileExists();
   });
+  s.close();
   logAll('owner-sign', 'Settings in config.json signed by the owner');
   return 'Signed.' + (allStopped() ? ' Agents are still stopped: `bwalletx resume` turns them back on.' : '');
 }
 
 /** `bwalletx owner change`: old PIN, then a new one. The signed settings carry over. */
 export async function ownerChange(env: OwnerEnv = defaultOwnerEnv()): Promise<string> {
+  const hw = hardwareStore();
+  if ((hw && readAnchorOrRefuse(hw)) || readHwOwnerFile()) throw new OwnerRefused('This owner uses Touch ID or your Mac password; there is no PIN to change.');
   const owner = readOwnerFile();
   if (!owner) throw new OwnerRefused('No owner PIN is set. Run `bwalletx owner setup`.');
   const s = await requireOwner('change the owner PIN', env);
@@ -380,14 +518,68 @@ export async function ownerChange(env: OwnerEnv = defaultOwnerEnv()): Promise<st
   return 'Owner PIN changed.';
 }
 
-/** `bwalletx owner status`: never needs the PIN, never prints secrets. */
+/**
+ * `bwalletx owner reset` (Mac): remove the Touch ID owner key from the Keychain, after Touch ID. Then everything runs
+ * at the safe defaults until `owner setup` (Touch ID again). A shell can delete the Keychain item itself too, but
+ * that only leaves the owner files pointing at a missing key: everything stays stopped, and setup needs Touch ID.
+ */
+export async function ownerReset(env: OwnerEnv = defaultOwnerEnv()): Promise<string> {
+  assertHuman('reset the owner', env);
+  const hw = hardwareStore();
+  const anchor = hw ? readAnchorOrRefuse(hw) : null;
+  if (!hw || !anchor) throw new OwnerRefused('There is no Touch ID owner key on this machine, so there is nothing to reset.');
+  const ok = await env.confirm('Remove the Touch ID owner key? Every account then runs at the safe defaults ($10/day, 30/hour, strategies on paper) until you run `bwalletx owner setup` again.');
+  if (!ok) return 'Nothing changed.';
+  const signer = await presenceSigner(hw, anchor, 'reset the bwalletx owner (removes the Touch ID owner key)', env);
+  signer.close?.();
+  hw.removeAnchor();
+  rmSync(ownerPath(), { force: true });
+  rmSync(settingsPath(), { force: true });
+  logAll('owner-reset', 'Touch ID owner key removed (Touch ID)');
+  return 'Owner reset. Every account runs at the safe defaults until you run `bwalletx owner setup`.';
+}
+
+/** `bwalletx owner upgrade` (Mac): move a 0.6.0 PIN owner to a Touch ID key, keeping the signed settings. */
+export async function ownerUpgrade(env: OwnerEnv = defaultOwnerEnv()): Promise<string> {
+  assertHuman('move the owner to Touch ID', env);
+  const hw = hardwareStore();
+  if (!hw) throw new OwnerRefused('This machine has no hardware key store (Touch ID / Secure Enclave), so the owner stays a PIN.');
+  if (readAnchorOrRefuse(hw)) throw new OwnerRefused('The owner already uses Touch ID.');
+  if (!readOwnerFile()) throw new OwnerRefused('No owner PIN is set. Run `bwalletx owner setup` (on this Mac it uses Touch ID).');
+  env.say(`Moving the owner to ${hw.prompt}. bwalletx first builds a small helper with Apple's swiftc (a few seconds).`);
+  const avail = await hw.available();
+  if (!avail.ok) throw new OwnerRefused(`This Mac can't make a Touch ID owner key (${avail.why}). The PIN stays.`);
+  const pinSession = await requireOwner('move the owner to Touch ID', env);
+  const { body, source } = pinSession.base();
+  const anchor = await hw.generate();
+  const signer = await presenceSigner(hw, anchor, 'move the bwalletx owner to Touch ID', env);
+  try {
+    hw.saveAnchor(anchor);
+    writeOwnerFile(hwOwnerFile(anchor, hw.kind));
+    await writeSignedSettings({ ...body, publicKey: anchor.publicKey, seq: body.seq + 1, signedAt: Date.now() }, signer);
+  } finally {
+    signer.close?.();
+  }
+  say(env, source);
+  logAll('owner-upgrade', `Owner moved from PIN to ${hw.prompt}`);
+  return `The owner now uses ${hw.prompt}. The old PIN no longer does anything.`;
+}
+
+/** `bwalletx owner status`: never needs the PIN or Touch ID, never prints secrets. */
 export function ownerStatus() {
   const st = readOwnerState();
   const cfg = readConfig();
+  const hw = hardwareStore();
   const stopAll = stopFileExists() || st.state === 'tampered' || (st.state === 'ok' && st.settings.stopAll);
+  const gate = st.state === 'unset' ? (hw ? 'hardware' : 'software') : st.gate;
+  const software = gate === 'software';
   return {
-    pin: st.state === 'unset' ? 'not set' : st.state === 'ok' ? 'set' : 'set, but the files could not be verified',
+    pin: st.state === 'unset' ? 'not set' : gate === 'hardware' ? 'none (Touch ID owner)' : st.state === 'ok' ? 'set' : 'set, but the files could not be verified',
     state: st.state,
+    /** 'hardware': loosening needs Touch ID / the Mac password; 'software': a PIN at a terminal. */
+    gate,
+    owner: st.state === 'unset' ? 'not set up' : gate === 'hardware' ? `${hw?.prompt ?? 'a hardware key'} (${hw?.label ?? 'not on this machine'})` : 'owner PIN',
+    ...(software && { warning: SOFTWARE_ONLY_WARNING + (hw && st.state !== 'unset' ? ' This Mac can do better: run `bwalletx owner upgrade` to move the owner to Touch ID.' : '') }),
     ...(st.state === 'tampered' && { why: st.why }),
     stopped: stopAll,
     accounts: Object.values(cfg.accounts).map((a) => {
@@ -402,4 +594,3 @@ export function ownerStatus() {
     }),
   };
 }
-

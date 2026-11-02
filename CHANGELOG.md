@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.0 (unreleased)
+
+Closes the known gap in the 0.6.0 owner PIN: an agent with a shell could fake a terminal (`script`), unset
+`CLAUDECODE`, set its own PIN, or delete the owner files and set one again.
+
+- **On a Mac, the owner is Touch ID.** `bwalletx owner setup` makes the owner key inside the Secure Enclave, with
+  an access control that needs Touch ID or your Mac password for every signature. Loosening asks for it (one
+  prompt per command); tightening still needs nothing. No native npm module: a small Swift helper is compiled
+  with Apple's `swiftc` when needed (Xcode Command Line Tools), and the Keychain is used through `/usr/bin/security`.
+- **Deleting the owner files no longer resets anything.** An entry in the login Keychain records the owner key.
+  While it exists, setup is refused and owner files that don't match it read as stopped. `bwalletx owner reset`
+  (Touch ID) removes it. If the Keychain can't be read, everything is treated as stopped.
+- **`bwalletx owner upgrade`** moves a 0.6.0 PIN owner to Touch ID and keeps the signed limits.
+- **Elsewhere (Linux, CI)** the PIN stays, and `bwalletx owner status` warns that the gate is software-only.
+- `owner status` (and `--json`) now reports `gate: "hardware" | "software"` and a `warning` for software-only.
+- After a `stop`, resuming a Touch ID owner shows the limits from before the stop and asks whether to keep them
+  (No = the safe defaults).
+
 ## 0.6.0 (unreleased)
 
 A safety release. If you let an AI agent use bwalletx, upgrade.

@@ -20,14 +20,21 @@
  *
  * (The brief asked for an HMAC keyed from the PIN. An HMAC can only be checked by someone holding the key, and
  * the gate runs unattended without the PIN, so a PIN-derived signature key does the same job and can be checked.)
+ *
+ * 0.7.0, hardware owner (see hardwareOwner.ts): on a Mac the owner key is a Secure Enclave P-256 key that needs
+ * Touch ID or the Mac password for every signature, and an anchor in the macOS Keychain says which key is the
+ * owner. While an anchor exists the settings must verify against ITS public key, owner.json must be the matching
+ * hardware owner file, and a PIN owner is not accepted. Deleting the owner files then reads as tampered (stopped).
  */
 import { createHash, createPrivateKey, createPublicKey, randomBytes, scryptSync, sign as edSign, timingSafeEqual, verify as edVerify, type KeyObject } from 'node:crypto';
+import { hardwareStore, type HwAnchor } from './hardwareOwner.js';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DEFAULT_DAILY_CAP_USD, home, RATE_LIMIT_PER_HOUR } from './limits.js';
 import type { Loaded } from './strategy.js';
 
 export const OWNER_FORMAT = 'bwalletx.owner/1';
+export const OWNER_HW_FORMAT = 'bwalletx.owner-hw/1';
 export const SETTINGS_FORMAT = 'bwalletx.owner-settings/1';
 export const PIN_MIN_LENGTH = 8;
 /** ~0.2 s and 64 MiB per try on a laptop. Stored in owner.json, so it can be raised later. */
@@ -36,6 +43,8 @@ const SCRYPT_N_MIN = 2 ** 10;
 const SCRYPT_N_MAX = 2 ** 20;
 const SIGN_DOMAIN = 'bwalletx-owner-settings/1\n';
 const VERIFY_DOMAIN = 'bwalletx-owner-verify/1';
+/** Signed by the hardware key to prove the owner answered the prompt just now (never stored). */
+export const PRESENCE_DOMAIN = 'bwalletx-owner-presence/1\n';
 const ED25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
 
 export type ScryptParams = { N: number; r: number; p: number };
@@ -46,6 +55,15 @@ export type OwnerFile = {
   publicKey: string;
   createdAt: number;
 };
+/** owner.json for a hardware owner: a mirror of the Keychain anchor (the anchor is what counts). */
+export type HwOwnerFile = {
+  format: typeof OWNER_HW_FORMAT;
+  store: string;
+  publicKey: string;
+  createdAt: number;
+};
+export type AnyOwnerFile = OwnerFile | HwOwnerFile;
+export type Gate = 'hardware' | 'software';
 export type SignedAccount = {
   dailyCapUsd: number | null;
   ratePerHour: number | null;
@@ -69,8 +87,8 @@ export type SettingsFile = SettingsBody & {
 };
 export type OwnerState =
   | { state: 'unset' }
-  | { state: 'ok'; owner: OwnerFile; settings: SettingsFile }
-  | { state: 'tampered'; why: string; owner: OwnerFile | null; settings: SettingsFile | null };
+  | { state: 'ok'; gate: Gate; owner: AnyOwnerFile; settings: SettingsFile }
+  | { state: 'tampered'; gate: Gate; why: string; owner: AnyOwnerFile | null; settings: SettingsFile | null };
 
 export const ownerPath = () => join(home(), 'owner.json');
 export const settingsPath = () => join(home(), 'owner-settings.json');
@@ -111,6 +129,23 @@ const writeAtomic = (file: string, v: unknown) => {
 const privateFromSeed = (seed: Buffer): KeyObject => createPrivateKey({ key: Buffer.concat([ED25519_PKCS8_PREFIX, seed]), format: 'der', type: 'pkcs8' });
 const rawPublicHex = (k: KeyObject) => Buffer.from(String((createPublicKey(k).export({ format: 'jwk' }) as { x: string }).x), 'base64url').toString('hex');
 const publicFromHex = (hex: string): KeyObject => createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: Buffer.from(hex, 'hex').toString('base64url') }, format: 'jwk' });
+/** An uncompressed P-256 public key (04 || x || y, hex) as a KeyObject. */
+const p256FromHex = (hex: string): KeyObject => {
+  const b = Buffer.from(hex, 'hex');
+  return createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: b.subarray(1, 33).toString('base64url'), y: b.subarray(33, 65).toString('base64url') }, format: 'jwk' });
+};
+const isEd25519Hex = (s: string) => isHex(s, 64);
+const isP256Hex = (s: string) => isHex(s, 130) && s.startsWith('04');
+/** Checks a signature by an owner key: Ed25519 (PIN owner) or P-256 ECDSA, raw r||s (hardware owner). */
+export function verifyOwnerSig(msg: Buffer, sig: Buffer, publicKey: string): boolean {
+  try {
+    if (isEd25519Hex(publicKey)) return edVerify(null, msg, publicFromHex(publicKey), sig);
+    if (isP256Hex(publicKey)) return sig.length === 64 && edVerify('sha256', msg, { key: p256FromHex(publicKey), dsaEncoding: 'ieee-p1363' }, sig);
+  } catch {
+    /* malformed key or signature */
+  }
+  return false;
+}
 
 function derive(pin: string, kdf: OwnerFile['kdf']) {
   const dk = scryptSync(pin.normalize('NFC'), Buffer.from(kdf.salt, 'hex'), 64, { N: kdf.N, r: kdf.r, p: kdf.p, maxmem: 256 * 1024 * 1024 });
@@ -146,7 +181,8 @@ export function unlockOwner(pin: string, file: OwnerFile): { priv: KeyObject; pu
   return { priv: d.priv, publicKey: d.publicKey };
 }
 
-export const writeOwnerFile = (f: OwnerFile) => writeAtomic(ownerPath(), f);
+export const writeOwnerFile = (f: AnyOwnerFile) => writeAtomic(ownerPath(), f);
+export const hwOwnerFile = (a: HwAnchor, store: string): HwOwnerFile => ({ format: OWNER_HW_FORMAT, store, publicKey: a.publicKey, createdAt: a.createdAt });
 
 const validOwner = (v: unknown): OwnerFile | null => {
   const o = v as OwnerFile | null;
@@ -157,7 +193,13 @@ const validOwner = (v: unknown): OwnerFile | null => {
   if (!isHex(salt, 32) || !isHex(o.verifier, 64) || !isHex(o.publicKey, 64)) return null;
   return o;
 };
+/** The PIN owner file, or null (missing, edited, or a hardware owner file). */
 export const readOwnerFile = (): OwnerFile | null => validOwner(readJson(ownerPath()));
+const validHwOwner = (v: unknown): HwOwnerFile | null => {
+  const o = v as HwOwnerFile | null;
+  return o && o.format === OWNER_HW_FORMAT && typeof o.store === 'string' && isP256Hex(o.publicKey) && typeof o.createdAt === 'number' ? o : null;
+};
+export const readHwOwnerFile = (): HwOwnerFile | null => validHwOwner(readJson(ownerPath()));
 
 // ---- signed settings ----
 export const bodyOf = (s: SettingsBody): SettingsBody => ({
@@ -168,18 +210,33 @@ export const bodyOf = (s: SettingsBody): SettingsBody => ({
   stopAll: s.stopAll,
   accounts: s.accounts,
 });
-export const signBody = (body: SettingsBody, priv: KeyObject) => edSign(null, Buffer.from(SIGN_DOMAIN + canonical(bodyOf(body))), priv).toString('hex');
-const verifyBody = (body: SettingsBody, sig: string, publicKey: string) => {
-  try {
-    return edVerify(null, Buffer.from(SIGN_DOMAIN + canonical(bodyOf(body))), publicFromHex(publicKey), Buffer.from(sig, 'hex'));
-  } catch {
-    return false;
-  }
-};
+/** The exact bytes an owner key signs for a settings body. */
+export const settingsMessage = (body: SettingsBody) => Buffer.from(SIGN_DOMAIN + canonical(bodyOf(body)));
+export const signBody = (body: SettingsBody, priv: KeyObject) => edSign(null, settingsMessage(body), priv).toString('hex');
+const verifyBody = (body: SettingsBody, sig: string, publicKey: string) => verifyOwnerSig(settingsMessage(body), Buffer.from(sig, 'hex'), publicKey);
+
+/** Something that can sign as the owner: the PIN key in memory, or a hardware presence session. */
+export interface OwnerSigner {
+  readonly publicKey: string;
+  readonly kind: 'pin' | 'hardware';
+  sign(msg: Buffer): Promise<Buffer>;
+  /** Only the PIN signer has it (Ed25519 is deterministic, which recoverAfterStop needs). */
+  readonly priv?: KeyObject;
+  close?(): void;
+}
+export const pinSigner = (priv: KeyObject, publicKey: string): OwnerSigner => ({ publicKey, kind: 'pin', priv, sign: async (m) => edSign(null, m, priv) });
+
+/** Sign and save settings with any owner signer. The signature is checked before anything is written. */
+export async function writeSignedSettings(body: SettingsBody, signer: OwnerSigner) {
+  const b = { ...bodyOf(body), publicKey: signer.publicKey };
+  const sig = (await signer.sign(settingsMessage(b))).toString('hex');
+  if (!verifyBody(b, sig, signer.publicKey)) throw new Error('The owner signature did not verify. Nothing was saved.');
+  writeAtomic(settingsPath(), { ...b, sig } satisfies SettingsFile);
+}
 
 const validSettings = (v: unknown): SettingsFile | null => {
   const s = v as SettingsFile | null;
-  if (!s || s.format !== SETTINGS_FORMAT || !isHex(s.publicKey, 64) || typeof s.seq !== 'number' || typeof s.signedAt !== 'number' || typeof s.stopAll !== 'boolean') return null;
+  if (!s || s.format !== SETTINGS_FORMAT || !(isEd25519Hex(s.publicKey) || isP256Hex(s.publicKey)) || typeof s.seq !== 'number' || typeof s.signedAt !== 'number' || typeof s.stopAll !== 'boolean') return null;
   if (!s.accounts || typeof s.accounts !== 'object' || Array.isArray(s.accounts)) return null;
   for (const a of Object.values(s.accounts)) {
     if (!a || typeof a !== 'object' || typeof a.stopped !== 'boolean') return null;
@@ -195,22 +252,59 @@ export const writeSettings = (body: SettingsBody, priv: KeyObject) => {
   writeAtomic(settingsPath(), { ...b, sig: signBody(b, priv) } satisfies SettingsFile);
 };
 
-/** Where the owner protection stands right now. Cheap: two small files and one Ed25519 verify. */
+/** The settings file as read: undefined when missing, null when unreadable/invalid. */
+const readSettingsFile = (): { raw: unknown; settings: SettingsFile | null } => {
+  const raw = existsSync(settingsPath()) ? readJson(settingsPath()) : undefined;
+  return { raw, settings: raw === undefined ? null : validSettings(raw) };
+};
+
+/** Shared checks once the owner's public key is known. */
+function checkSettings(gate: Gate, owner: AnyOwnerFile, publicKey: string, raw: unknown, settings: SettingsFile | null): OwnerState {
+  const who = gate === 'hardware' ? 'the owner (Touch ID)' : 'the owner PIN';
+  if (!settings) return { state: 'tampered', gate, why: raw === undefined ? 'owner-settings.json is missing' : 'owner-settings.json is unreadable or was edited', owner, settings: null };
+  if (settings.publicKey !== publicKey) return { state: 'tampered', gate, why: 'owner-settings.json was signed by a different owner key', owner, settings };
+  if (!settings.sig) return { state: 'tampered', gate, why: settings.broken ? `stopped (${settings.broken.by}); ${who} resumes` : 'owner-settings.json is not signed', owner, settings };
+  if (!verifyBody(settings, settings.sig, publicKey)) return { state: 'tampered', gate, why: 'owner-settings.json was edited (bad signature)', owner, settings };
+  return { state: 'ok', gate, owner, settings };
+}
+
+/**
+ * Where the owner protection stands right now. Cheap: two small files, one Keychain read on a Mac (cached for a
+ * moment) and one signature check. Anything that can't be verified reads as 'tampered', which stops everything.
+ */
 export function readOwnerState(): OwnerState {
+  const hw = hardwareStore();
+  let anchor: HwAnchor | null = null;
+  if (hw) {
+    try {
+      anchor = hw.readAnchor();
+    } catch (e) {
+      // Fail closed: an unreadable Keychain could be hiding an owner key.
+      return { state: 'tampered', gate: 'hardware', why: e instanceof Error ? e.message : String(e), owner: null, settings: readSettingsFile().settings };
+    }
+  }
   const ownerExists = existsSync(ownerPath());
-  const rawSettings = existsSync(settingsPath()) ? readJson(settingsPath()) : undefined;
-  const settings = rawSettings === undefined ? null : validSettings(rawSettings);
+  const { raw, settings } = readSettingsFile();
+
+  if (anchor) {
+    // The Keychain says a hardware owner exists. Only its key counts; deleting or swapping files can't get round it.
+    const owner = readHwOwnerFile();
+    if (!ownerExists)
+      return { state: 'tampered', gate: 'hardware', why: 'the owner files were deleted but the owner key is still in the macOS Keychain; `bwalletx resume` (Touch ID) restores, `bwalletx owner reset` starts over', owner: null, settings };
+    if (!owner) return { state: 'tampered', gate: 'hardware', why: 'owner.json is not the Touch ID owner (edited or replaced)', owner: readOwnerFile(), settings };
+    if (owner.publicKey !== anchor.publicKey) return { state: 'tampered', gate: 'hardware', why: 'owner.json does not match the owner key in the macOS Keychain', owner, settings };
+    return checkSettings('hardware', owner, anchor.publicKey, raw, settings);
+  }
+
   if (!ownerExists) {
-    if (rawSettings !== undefined) return { state: 'tampered', why: 'owner.json is missing but signed settings exist', owner: null, settings };
+    if (raw !== undefined) return { state: 'tampered', gate: 'software', why: 'owner.json is missing but signed settings exist', owner: null, settings };
     return { state: 'unset' };
   }
+  const hwOwner = readHwOwnerFile();
+  if (hwOwner) return { state: 'tampered', gate: 'hardware', why: hw ? 'the owner key was removed from the macOS Keychain outside `bwalletx owner reset`' : 'this owner uses a hardware key that this machine does not have', owner: hwOwner, settings };
   const owner = readOwnerFile();
-  if (!owner) return { state: 'tampered', why: 'owner.json is unreadable or was edited', owner: null, settings };
-  if (!settings) return { state: 'tampered', why: rawSettings === undefined ? 'owner-settings.json is missing' : 'owner-settings.json is unreadable or was edited', owner, settings: null };
-  if (settings.publicKey !== owner.publicKey) return { state: 'tampered', why: 'owner-settings.json was signed by a different owner key', owner, settings };
-  if (!settings.sig) return { state: 'tampered', why: settings.broken ? `stopped (${settings.broken.by}); the owner PIN resumes` : 'owner-settings.json is not signed', owner, settings };
-  if (!verifyBody(settings, settings.sig, owner.publicKey)) return { state: 'tampered', why: 'owner-settings.json was edited (bad signature)', owner, settings };
-  return { state: 'ok', owner, settings };
+  if (!owner) return { state: 'tampered', gate: 'software', why: 'owner.json is unreadable or was edited', owner: null, settings };
+  return checkSettings('software', owner, owner.publicKey, raw, settings);
 }
 
 /** True when the owner state alone means "everything stopped": a bad/missing signature, or signed stopAll. */

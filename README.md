@@ -10,7 +10,7 @@ Only agent accounts can be exported, never the main wallet. The agent account's 
 
 ```sh
 npm i -g bwalletx      # Node 20+
-bwalletx owner setup   # once, in your own terminal: set the owner PIN (see "Owner PIN" below)
+bwalletx owner setup   # once, in your own terminal: Touch ID on a Mac, an owner PIN elsewhere (see "Owner" below)
 ```
 
 ## Pair with your phone (recommended)
@@ -162,7 +162,7 @@ find it the same way they find BSV Desktop. Built on `@bsv/wallet-toolbox`; keys
 - Until an owner PIN is set, every account is clamped to **$10/day, 30 spending actions/hour, strategies on paper**,
   whatever config.json says.
 
-## Owner PIN
+## Owner
 
 Raising or clearing a cap, a rate limit or the approval threshold, `resume`, `strategy load --live`, `key import` /
 `key new`, `login` / `pair`, `brc100 migrate` and starting `serve` all **loosen** safety settings. Since 0.6.0
@@ -196,6 +196,36 @@ config.json), `owner status` (no PIN).
 live strategies refused). In your own terminal run `bwalletx owner setup`, choose a PIN, check the settings it
 lists and answer `y` to keep them (live strategies included), or `N` for the safe defaults.
 
+### On a Mac: Touch ID instead of the PIN (0.7.0)
+
+A PIN at a terminal has a known gap: an agent with a shell can fake a terminal (`script`) and unset `CLAUDECODE`.
+Before a PIN exists it can set its own, and after that it can delete the owner files and set one again. So on a
+Mac with a Secure Enclave (every Apple silicon Mac, and Intel Macs with a T2 chip) the owner is a hardware key:
+
+- `bwalletx owner setup` makes the owner key **inside the Secure Enclave**, with an access control that needs
+  **Touch ID or your Mac password for every signature**. A shell can't answer that prompt, and the Enclave itself
+  refuses to sign without it. There is no PIN.
+- Every loosening asks for Touch ID (one prompt per command). Tightening still needs nothing.
+- An entry in your **login Keychain** ("bwalletx owner key") records which key is the owner. While it exists,
+  setup is refused. Deleting `~/.bwalletx/owner*.json` only leaves everything **stopped**; `bwalletx resume` or
+  `bwalletx owner sign` (Touch ID) restores, and **`bwalletx owner reset`** (Touch ID) removes the key to start
+  over. Forged owner files signed by any other key are refused.
+- If the Keychain can't be read, bwalletx assumes the worst: everything stopped, nothing loosened.
+- Setup on a Mac never falls back to a PIN, except on a Mac that definitely has no Secure Enclave. If the helper
+  can't be built (see below), setup is refused and the safe defaults apply.
+- Already have a 0.6.0 PIN? `bwalletx owner upgrade` (PIN, then Touch ID) moves it to Touch ID and keeps your
+  signed limits. Until then `owner status` warns that the gate is software-only.
+
+How it works with no native npm module: bwalletx carries a ~60-line Swift helper (CryptoKit + LocalAuthentication)
+as source, compiles it with Apple's `/usr/bin/swiftc` into a private temp folder the first time an owner command
+needs it (a few seconds; it's deleted on exit), and talks to the Keychain with Apple's `/usr/bin/security`. Both
+run by absolute path with a cleaned environment. This needs the **Xcode Command Line Tools** (`xcode-select
+--install`; you already have them if `git` works). CryptoKit Enclave keys don't need an app entitlement, so an
+unsigned helper can make and use them, and the key's wrapped blob is useless on any other Mac or without the prompt.
+
+**On Linux, Windows and CI** there is no hardware store, so the 0.6.0 PIN stays and `bwalletx owner status` says,
+every time, that the gate is software-only.
+
 **What this does not do.** It stops an agent that runs `bwalletx cap <acct> off` or edits the JSON files. It can't
 stop an agent that has a shell **and** knows your PIN **and** fakes a terminal; or one that deletes all the owner
 files (that only gets it back to the defaults above, and `owner status` then shows no PIN); or one that copies an
@@ -207,6 +237,12 @@ the key itself and skip bwalletx entirely. So for real money:
   and no bwalletx code path, the owner PIN included, can approve a spend;
 - keep key-file accounts small (the balance is the budget);
 - don't give an AI agent a shell on the machine that holds a key-file account with real money.
+
+The Touch ID owner closes the fake-terminal and delete-the-files routes. It can't stop an agent that rewrites
+bwalletx itself (or runs an older version), or one that builds its own key, writes its own Keychain entry and
+signs owner files with it: nothing on the Mac can prove later that a key in the Keychain came from the Enclave.
+Removing the Keychain entry from a shell only stops everything (setup then needs Touch ID). If you give an agent
+screen control and your Mac password, it can answer the password fallback of the prompt.
 
 ## The gate
 
@@ -345,7 +381,7 @@ accounts need `BWALLETX_PASSPHRASE` in the MCP env, paired accounts sign on the 
 
 **Human-only, never exposed over MCP:** raising caps or limits, `resume`, `strategy load --live`, `key import`,
 `pair` / `login` / `logout`, `brc100 migrate`, and starting/stopping `serve`. Being off MCP is not the only guard:
-the commands themselves need the owner PIN at a terminal (see "Owner PIN"), so an agent with a shell can't just run
+the commands themselves need the owner (Touch ID on a Mac, else the PIN at a terminal; see "Owner"), so an agent with a shell can't just run
 them either. An agent can stop things (`stop_all`, `lower_cap`) but never turn them back on or raise its own limits.
 
 `mint` publishes files on chain for anyone to read, so over MCP it only reads the mint folder. Put the files you

@@ -276,7 +276,7 @@ describe('approve-above cannot be bypassed', () => {
     expect(send(1.5).ok).toBe(true);
     // the session object has no way to approve a spend: only settings
     const s = await og.requireOwner('test', env({ answers: [PIN] }));
-    expect(Object.getOwnPropertyNames(Object.getPrototypeOf(s)).sort()).toEqual(['base', 'constructor', 'update']);
+    expect(Object.getOwnPropertyNames(Object.getPrototypeOf(s)).sort()).toEqual(['base', 'close', 'constructor', 'kind', 'publicKey', 'update']);
     expect(send(3)).toMatchObject({ ok: false, rule: 'approval' });
   });
 });
