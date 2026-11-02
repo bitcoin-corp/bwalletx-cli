@@ -47,7 +47,8 @@ program
       const owner = await og.requireOwner(`pair a phone account as "${o.account}"`);
       if (!asJson) await banner();
       const p = await login(o.account, {});
-      og.approveNewAccount(owner, p.name);
+      await og.approveNewAccount(owner, p.name);
+      owner.close();
       console.log(`\nPaired "${p.name}" with ${p.account}: ${p.scopes.join(', ')} until ${new Date(p.expiresAt).toLocaleDateString()}.`);
       console.log('Keep bWalletX open on that account while the CLI works. Try: bwalletx balance --account ' + p.name);
     }),
@@ -63,7 +64,8 @@ program
       const owner = await og.requireOwner(`pair your main wallet as "${o.account}"`);
       if (!asJson) await banner();
       const p = await login(o.account, { mode: 'brc100' });
-      og.approveNewAccount(owner, p.name);
+      await og.approveNewAccount(owner, p.name);
+      owner.close();
       console.log(`\nPaired "${p.name}" with ${p.account} as your main wallet until ${new Date(p.expiresAt).toLocaleDateString()}.`);
       console.log(`Serve it to sites: bwalletx serve --wallet paired --account ${p.name} --origin <site>. Revoke: bwalletx logout --account ${p.name}`);
     }),
@@ -83,7 +85,8 @@ key
     run(async (file: string) => {
       const owner = await og.requireOwner(`import the key file ${file}`);
       const a = await act.importKey(file);
-      og.approveNewAccount(owner, a.name);
+      await og.approveNewAccount(owner, a.name);
+      owner.close();
       print(a, () => `Imported "${a.name}"\n  pay address: ${a.payAddress}\n  ord address: ${a.ordAddress}\n  stored: ${keyFilePath(a.name)} (encrypted, mode 600)`);
     }),
   );
@@ -97,7 +100,8 @@ key
       const out = o.out === '<name>.key.json' ? `${name}.key.json` : o.out;
       const owner = await og.requireOwner(`make a new agent account "${name}"`);
       const a = await act.newKey(name, out, process.env.BWALLETX_PASSPHRASE || undefined);
-      og.approveNewAccount(owner, a.name);
+      await og.approveNewAccount(owner, a.name);
+      owner.close();
       print(a, () => `Made "${a.name}"\n  identity key: ${a.identityKey}\n  pay address: ${a.payAddress}\n  ord address: ${a.ordAddress}\n  key file: ${out} (keep it; it is the only copy of these keys)\n  stored: ${keyFilePath(a.name)} (encrypted, mode 600)`);
     }),
   );
@@ -175,22 +179,30 @@ program
   .description('set an account daily cap in USD ("off" to clear; lowering is free, raising or clearing needs the owner PIN)')
   .action(run(async (name: string, v: string) => console.log(await og.setCap(name, v))));
 
-const owner = program.command('owner').description('the owner PIN that guards every loosening of a safety setting');
+const owner = program.command('owner').description('the owner (Touch ID on a Mac, else a PIN) that guards every loosening of a safety setting');
 owner
   .command('setup')
-  .description('set the owner PIN (once) and sign your current settings; run it in your own terminal')
-  .action(run(async () => void (await og.setupOwner())));
+  .description('set up the owner (once) and sign your current settings: Touch ID on a Mac, a PIN elsewhere; run it in your own terminal')
+  .action(run(async () => (await og.setupOwner()).close()));
 owner
   .command('change')
-  .description('change the owner PIN (asks for the old one)')
+  .description('change the owner PIN (asks for the old one; not used with Touch ID)')
   .action(run(async () => console.log(await og.ownerChange())));
 owner
   .command('sign')
-  .description('review the limits in config.json and sign them as the owner (owner PIN)')
+  .description('review the limits in config.json and sign them as the owner (Touch ID or PIN)')
   .action(run(async () => console.log(await og.ownerSign())));
 owner
+  .command('upgrade')
+  .description('Mac: move a PIN owner to a Touch ID key in the Secure Enclave (PIN, then Touch ID)')
+  .action(run(async () => console.log(await og.ownerUpgrade())));
+owner
+  .command('reset')
+  .description('Mac: remove the Touch ID owner key (Touch ID); everything runs at the safe defaults until `owner setup`')
+  .action(run(async () => console.log(await og.ownerReset())));
+owner
   .command('status')
-  .description('whether a PIN is set, whether the signed settings check out, and the limits the gate enforces')
+  .description('who the owner is (Touch ID or PIN), whether the signed settings check out, and the limits the gate enforces')
   .action(
     run(() => {
       const s = og.ownerStatus();
@@ -198,10 +210,12 @@ owner
         `cap ${e.dailyCapUsd == null ? 'none' : `$${e.dailyCapUsd}/day`}, ${e.ratePerHour === 0 ? 'no rate limit' : `${e.ratePerHour}/hour`}, approve above ${e.approveAboveUsd == null ? 'none' : `$${e.approveAboveUsd}`}${e.stopped ? ', STOPPED' : ''}`;
       print(s, () =>
         [
-          `owner PIN: ${s.pin}${'why' in s && s.why ? ` (${s.why})` : ''}`,
+          `owner: ${s.owner}${'why' in s && s.why ? ` (${s.why})` : ''}`,
+          s.state === 'unset' ? `gate: none yet (setup here uses ${s.gate === 'hardware' ? 'Touch ID' : 'a PIN'})` : `gate: ${s.gate === 'hardware' ? 'hardware (loosening needs Touch ID or your Mac password)' : 'software-only (owner PIN)'}`,
+          'warning' in s && s.warning ? `WARNING: ${s.warning}` : '',
           `kill switch: ${s.stopped ? 'ON (everything refused)' : 'off'}`,
           ...s.accounts.map((a) => `  ${a.name}: ${lim(a.effective)}${a.strategy ? `; strategy "${a.strategy.name}" (${a.strategy.mode}${a.strategy.mode === 'live' ? (a.strategy.approved ? ', approved' : ', NOT approved: refused') : ''})` : ''}`),
-          s.state === 'unset' ? 'Set a PIN with `bwalletx owner setup`. Until then the defaults apply ($10/day, 30/hour, strategies on paper).' : '',
+          s.state === 'unset' ? 'Set up the owner with `bwalletx owner setup`. Until then the defaults apply ($10/day, 30/hour, strategies on paper).' : '',
         ]
           .filter(Boolean)
           .join('\n'),
@@ -406,7 +420,8 @@ strategy
       // Live = real money: the owner PIN at a terminal (BWALLETX_YES does not skip it). Paper needs nothing.
       const owner = o.live ? await og.requireOwner(`load ${file} LIVE (real money) into ${resolveAccount(o.account).name}`) : null;
       const r = await act.strategyLoad(file, o.account, !!o.live);
-      if (owner && r.mode === 'live') og.approveLiveStrategy(owner, r.account);
+      if (owner && r.mode === 'live') await og.approveLiveStrategy(owner, r.account);
+      owner?.close();
       print(r, () => `Loaded "${r.strategy.name}" v${r.strategy.version} into ${r.account} (${r.mode}${r.mode === 'paper' ? ', $100 paper book' : ''})`);
     }),
   );
@@ -501,7 +516,7 @@ brc
   .option('-a, --account <name>', 'agent account')
   .action(
     run(async (o: { account?: string }) => {
-      await og.requireOwner('move the old CLI wallet into the shared wallet');
+      (await og.requireOwner('move the old CLI wallet into the shared wallet')).close();
       const { name, keys, b, w: shared } = await brc100Account(o.account, true);
       const local = await b.openWallet(name, keys);
       try {
@@ -647,7 +662,7 @@ program
       }
       if (!o.origin?.length) throw new Error('serve needs --origin <host...> (or --list-pairings / --revoke <origin>)');
       const origins = o.origin;
-      await og.requireOwner(`serve this wallet to ${origins.join(', ')}`);
+      (await og.requireOwner(`serve this wallet to ${origins.join(', ')}`)).close();
       const confirmPairing = async ({ origin, code }: { origin: string; code: string }) => {
         if (!process.stdin.isTTY) {
           console.log(`Pairing request from ${origin} refused: serve has no terminal to ask in.`);
