@@ -16,6 +16,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs
 import { basename } from 'node:path';
 import { LockingScript, OP, Utils } from '@bsv/sdk';
 import { gateAction } from './gate.js';
+import { assertNothingUnsent } from './repair.js';
 import { bsvUsd } from './market.js';
 import { appendLog, withSpendLock } from './store.js';
 import type { AgentWallet } from './brc100.js';
@@ -55,7 +56,7 @@ export function stampedHash(scriptHex: string): string | null {
   return Utils.toHex(b.slice(at + 1));
 }
 
-type StampWallet = Pick<AgentWallet, 'wallet' | 'sendWaiting'>;
+type StampWallet = Pick<AgentWallet, 'wallet' | 'sendWaiting' | 'db'>;
 
 /** Stamp one file from an open agent wallet: gate, sign, broadcast, relay, log, optionally register. */
 export function stampWith(
@@ -66,6 +67,8 @@ export function stampWith(
 ): Promise<StampResult> {
   return withSpendLock(name, async () => {
     const sha256 = sha256File(file);
+    // Never build on a parent the network hasn't seen: it would be refused and lock the coins it spends (2 Nov 2026).
+    await assertNothingUnsent(w.db, name);
     const usd = (STAMP_FEE_SATS / 1e8) * o.rate;
     const g = gateAction(name, { kind: 'send', token: 'BSV', usd, to: 'stamp' });
     if (!g.ok) throw new Error(`Refused: ${g.reason}`);

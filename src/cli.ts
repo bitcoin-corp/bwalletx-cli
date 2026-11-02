@@ -519,6 +519,24 @@ brc
   );
 
 program
+  .command('repair')
+  .description("after a failed broadcast: re-send the wallet's unsent txs to ARC (with their parents) and free coins that failed, never-broadcast actions locked (checked unspent on chain)")
+  .option('-a, --account <name>', 'agent account')
+  .action(
+    run(async (o: { account?: string }) => {
+      const r = await b1.brc100Repair(o.account);
+      print(r, () =>
+        [
+          `${r.account}: re-sent ${r.rebroadcast.filter((x) => x.ok).length} of ${r.rebroadcast.length} unsent transactions`,
+          ...r.rebroadcast.map((x) => `  ${x.ok ? 'ok    ' : 'FAILED'} ${x.txid} ${x.detail ?? ''}`),
+          `freed ${r.freed.length} locked coins (${r.freed.reduce((n, x) => n + x.satoshis, 0)} sats)`,
+          ...r.skipped.map((x) => `  skipped ${x.outpoint}: ${x.reason}`),
+        ].join('\n'),
+      );
+    }),
+  );
+
+program
   .command('stamp <file>')
   .description("put the file's SHA-256 on chain (one OP_RETURN, bwx.stamp/1) from an agent key-file account; prints the txid. Only the hash goes on chain")
   .option('-a, --account <name>', 'agent account (key file; paired accounts are refused)')

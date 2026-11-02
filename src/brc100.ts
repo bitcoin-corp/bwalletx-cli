@@ -53,6 +53,8 @@ export type AgentWallet = {
   /** Fetch merkle proofs for the wallet's unproven txs and mark them completed (see opns/proofSync.ts). */
   syncProofs?: () => Promise<SyncResult>;
   close: () => Promise<void>;
+  /** The wallet's own SQLite storage (knex), for `bwalletx repair` and the unsent-parent guard. */
+  db?: import('./repair.js').Db;
 };
 
 /** The storage the bWalletX app syncs every account to (1Sat Storage). */
@@ -109,6 +111,7 @@ export async function openWallet(account: string, keys: AgentKeys): Promise<Agen
     wallet,
     identityKey,
     payAddress: rootKey.toAddress(),
+    db: knex as unknown as import('./repair.js').Db,
     sendWaiting: async () => {
       await monitor.runTask('SendWaiting').catch(() => undefined);
     },
