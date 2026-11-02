@@ -1,7 +1,7 @@
 /**
  * `bwalletx repair`: get an agent account's BRC-100 wallet back in step with the chain after a broadcast failed.
  *
- * Seen 2 Nov 2026 (company stamping account `bstamp`): `brc100 fund` signed the import tx but never broadcast it (the
+ * Seen 2 Nov 2026 (an account used for stamps): `brc100 fund` signed the import tx but never broadcast it (the
  * first broadcaster timed out, TAAL ARC answered 401, sendWaiting swallowed it). Two stamps then spent its outputs, the
  * network refused them ("missing inputs"), and the toolbox marked them failed but left their inputs unspendable:
  * ~10,089 sats gone from the balance while nothing had left the wallet on chain.
@@ -116,7 +116,7 @@ export async function repairWallet(db: Db, o: { post?: Post; isUnspent?: IsUnspe
     await db('transactions').where({ txid: req.txid }).whereIn('status', ['sending', 'unprocessed']).update({ status: 'unproven' });
   }
 
-  // "Failed" actions that landed anyway (2 Nov 2026: both bstamp stamps reached the mempool once their parent did): mark
+  // "Failed" actions that landed anyway (2 Nov 2026: two stamps reached the mempool once their parent did): mark
   // them unproven, their inputs spent by them, and their own outputs spendable where the chain says unspent.
   const failed: { transactionId: number; txid: string | null }[] = await db('transactions').where({ status: 'failed' });
   for (const t of failed) {

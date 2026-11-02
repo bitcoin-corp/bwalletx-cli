@@ -66,8 +66,18 @@ describe('serve payment safety', () => {
     expect(calls).toEqual(['createAction']);
   });
 
-  it("refuses --origin '*' unless explicitly allowed", async () => {
-    await expect(setup(['*'])).rejects.toThrow(/any web page/);
+  it("never accepts a wildcard origin: '*' is impossible (no override exists any more)", async () => {
+    await expect(setup(['*'])).rejects.toThrow(/wildcard/);
+    await expect(setup(['*'], { allowAnyOrigin: true })).rejects.toThrow(/wildcard/);
+    await expect(setup(['https://*'])).rejects.toThrow(/wildcard/);
+    await expect(setup(['*.example.com'])).rejects.toThrow(/wildcard/);
+    await expect(setup(['shop.example', '*'])).rejects.toThrow(/wildcard/);
+    await expect(setup([])).rejects.toThrow(/at least one site/);
+  });
+
+  it('an allowed site still needs its pairing token; other origins get 403', async () => {
+    const { post } = await setup(['shop.example']);
+    expect((await post('createAction', pay(1), 'https://evil.example')).status).toBe(403);
   });
 
   it('only signs BRC-103 login signatures when a single site is allowed', async () => {

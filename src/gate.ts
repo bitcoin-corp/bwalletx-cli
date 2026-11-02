@@ -17,9 +17,10 @@ import {
   type RuleState,
 } from './strategy.js';
 import { allStopped, appendLog, getLoaded, getPaper, readLog, resolveAccount, setPaper, type AccountConfig } from './store.js';
+import { RATE_LIMIT_PER_HOUR } from './limits.js';
+import { effectiveAccount, liveApproved, readOwnerState } from './owner.js';
 
-/** Default spending actions per hour; an account can set its own (`bwalletx ratelimit <account> <n|off>`). */
-export const RATE_LIMIT_PER_HOUR = 30;
+export { RATE_LIMIT_PER_HOUR };
 const HOUR = 3_600_000;
 
 /** Log actions that count toward the rate limit (attempted or done spends, live or paper). */
@@ -37,13 +38,15 @@ export type GateInput = {
   action: ActionRequest;
   extra?: Omit<RuleState, 'spentTodayUsd' | 'spentTotalUsd'>;
   now: number;
+  /** false when a live strategy is loaded that the owner has not signed (owner.ts). Default true (pure tests). */
+  liveApproved?: boolean;
 };
 export type GateResult =
   | { ok: true; paper: boolean; book?: PaperBook; logEntry?: AgentLogEntry }
   | { ok: false; reason: string; rule?: string; logEntry: AgentLogEntry };
 
 /** Pure decision. `book` (paper) and `logEntry` are what the caller persists. */
-export const evaluateGate = ({ account, stopAll, log, loaded, book, action: a, extra = {}, now }: GateInput): GateResult => {
+export const evaluateGate = ({ account, stopAll, log, loaded, book, action: a, extra = {}, now, liveApproved: liveOk = true }: GateInput): GateResult => {
   const refuse = (reason: string, rule?: string): GateResult => ({
     ok: false,
     reason,
@@ -59,6 +62,8 @@ export const evaluateGate = ({ account, stopAll, log, loaded, book, action: a, e
     now,
   );
   if (!acct.ok) return refuse(acct.reason, acct.reason.startsWith('Over today') ? 'dailyCap' : 'stop');
+  // A live strategy file the owner did not sign with the PIN (hand-edited, or loaded live before 0.6.0).
+  if (!paper && loaded && !liveOk) return refuse('Live strategy not approved with the owner PIN (run `bwalletx strategy load <file> --live` in your own terminal)', 'owner');
   // Bigger spends wait for the owner (bAgents approvals). Paper fills never need it.
   const limit = account?.approveAboveUsd;
   if (!paper && limit != null && a.usd > limit) return refuse(`Needs owner approval: over $${limit} per action`, 'approval');
@@ -101,16 +106,23 @@ export const evaluateGate = ({ account, stopAll, log, loaded, book, action: a, e
   };
 };
 
-/** Gate against stored state for an account; persists the log entry and paper book. */
+/**
+ * Gate against stored state for an account; persists the log entry and paper book.
+ * The account's limits are the EFFECTIVE ones: the tighter of the owner-signed ceiling and config.json, so a hand
+ * edit to config.json can't loosen anything (owner.ts). Approve-above is part of that and is never skipped here:
+ * there is no code path where the owner PIN approves a spend; the PIN only signs settings.
+ */
 export const gateAction = (name: string, action: ActionRequest, extra: GateInput['extra'] = {}, now = Date.now()) => {
+  const st = readOwnerState();
   let account: AccountConfig | null = null;
   try {
-    account = resolveAccount(name);
+    const a = resolveAccount(name);
+    account = { ...a, ...effectiveAccount(a, st) };
   } catch {
     account = null;
   }
   const loaded = getLoaded(name);
-  const res = evaluateGate({ account, stopAll: allStopped(), log: readLog(name), loaded, book: getPaper(name), action, extra, now });
+  const res = evaluateGate({ account, stopAll: allStopped(), log: readLog(name), loaded, book: getPaper(name), action, extra, now, liveApproved: liveApproved(st, name, loaded) });
   if (res.ok && res.book) setPaper(name, res.book);
   if (res.logEntry) appendLog(name, res.logEntry);
   return res;

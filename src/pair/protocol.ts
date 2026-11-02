@@ -1,7 +1,7 @@
 /**
  * Phone pairing protocol (tokenblaster.lol docs/wallet-connect.md §4), shared by the site side and
  * bWallet. Kept dependency-light (@bsv/sdk + WebCrypto) so the same file can be copied into sites
- * until it ships as @b0ase/wallet.
+ * until it ships as a package.
  *
  *   QR:     https://www.bwallet.space/pair?v=1&r=<relay host>&c=<channel>&k=<site pubkey>&o=<origin>&e=<expiry>
  *   key:    ECDH(secp256k1) → HKDF-SHA256(salt = channel bytes, info = "bwallet-pair-v1") → AES-256-GCM

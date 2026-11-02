@@ -50,7 +50,7 @@ export const parseNameList = (text: string): ParsedList => {
 /**
  * Valuable names first (owner, 13 Oct 2026: the full job takes ~11 days, so the best names must exist on day one):
  * by `rank` (vault and gift 0, then the lists in the order given), alphabetical within a rank so every prefix
- * comes before the names that extend it (b0as < b0ase < b0asex). No rank = alphabetical only.
+ * comes before the names that extend it (abc < abcd < abcde). No rank = alphabetical only.
  */
 export const orderForMinting = (names: string[], rank?: ReadonlyMap<string, number>): string[] => {
   const r = (n: string) => rank?.get(n) ?? Number.MAX_SAFE_INTEGER;

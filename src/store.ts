@@ -8,8 +8,9 @@
  *   STOP                           kill switch: while it exists every spending action is refused
  */
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { home } from './limits.js';
+import { breakSealForStop, ownerForcesStop } from './owner.js';
 import type { AgentLogEntry, Loaded, PaperBook } from './strategy.js';
 import { PAPER_START_USD } from './strategy.js';
 
@@ -36,12 +37,7 @@ export type AccountConfig = {
   stopped: boolean;
   importedAt: number;
 };
-/**
- * Daily cap (USD, per UTC day) a NEW account starts with (24 Oct 2026 audit): before this, new accounts
- * had no cap and an agent or MCP client could send the whole balance. Raise or clear with `bwalletx cap`.
- * Accounts that already exist keep whatever they had.
- */
-export const DEFAULT_DAILY_CAP_USD = 10;
+export { DEFAULT_DAILY_CAP_USD } from './limits.js';
 
 /** Most one MCP `send` / `brc100_withdraw` call may move, in USD, whatever the account caps say. */
 export const mcpMaxUsdPerCall = (env: Record<string, string | undefined> = process.env) => {
@@ -51,7 +47,7 @@ export const mcpMaxUsdPerCall = (env: Record<string, string | undefined> = proce
 
 export type Config = { defaultAccount?: string; accounts: Record<string, AccountConfig>; satsPerKb?: number };
 
-export const home = () => process.env.BWALLETX_HOME || join(homedir(), '.bwalletx');
+export { home };
 const p = (...parts: string[]) => join(home(), ...parts);
 const ensure = (dir: string) => mkdirSync(dir, { recursive: true, mode: 0o700 });
 const safe = (name: string) => {
@@ -137,11 +133,21 @@ export const setPaper = (name: string, b: PaperBook | null) => {
 
 // ---- kill switch ----
 const stopFile = () => p('STOP');
-export const allStopped = () => existsSync(stopFile());
-export const setAllStopped = (on: boolean) => {
+/**
+ * Stopped when the STOP file exists, or when the owner-signed settings say so or can't be verified
+ * (owner.ts: a missing or broken signature is the most restrictive state). Deleting STOP alone never resumes.
+ */
+export const allStopped = () => existsSync(stopFile()) || ownerForcesStop();
+/**
+ * Stopping is a tightening: anyone may do it (CLI, MCP, agent), no PIN. It also breaks the owner signature,
+ * so removing the STOP file by hand does not resume anything. Turning it off (`on = false`) only removes the
+ * file: `bwalletx resume` (ownerGate.ts) re-signs the settings with the owner PIN first.
+ */
+export const setAllStopped = (on: boolean, by = 'stop') => {
   if (on) {
     ensure(home());
     writeFileSync(stopFile(), `stopped at ${new Date().toISOString()}\n`, { mode: 0o600 });
+    breakSealForStop(by);
   } else rmSync(stopFile(), { force: true });
 };
 

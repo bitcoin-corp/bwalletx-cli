@@ -7,8 +7,10 @@
  * item and dollar limits approved at pairing. The phone checks the budget before it signs.
  */
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
-import { basename, dirname, extname, join, resolve } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { home } from './limits.js';
 import { bsvUsd } from './market.js';
 import { PhoneSession, type MintInfo } from './paired.js';
 import { appendLog, readConfig, resolveAccount } from './store.js';
@@ -257,4 +259,75 @@ export function itemsFor(files: string[], o: { title?: string; titleFromFilename
   if (o.title && files.length > 1) throw new Error('--title is for one file; use --title-from-filename for several');
   if (!o.title && !o.titleFromFilename) throw new Error('Give --title, or --title-from-filename');
   return files.map((f) => ({ file: f, title: o.title ?? titleFromFilename(f) }));
+}
+
+// ---- MCP mint: only files the owner put in the mint folder (0.6.0) ----
+/**
+ * MCP `mint` publishes files on chain for anyone to read, and a prompt injection could ask for any path.
+ * So over MCP only files inside ONE folder chosen by a human can be minted: ~/.bwalletx/mint-inbox, or
+ * `bwalletx mcp --mint-dir <dir>`. After resolving symlinks the file must still be inside it, no part of its
+ * path inside the folder may start with "." (dotfiles, .git, .env…), and ~/.ssh, ~/.claude*, ~/.gnupg, ~/.aws
+ * and the bwalletx key folder are refused wherever they are. The CLI's own `mint` (a human at a terminal) is not limited.
+ */
+export const MCP_MINT_CONFIRM_BYTES = 1024 * 1024;
+export const defaultMintDir = () => join(home(), 'mint-inbox');
+const SENSITIVE_SEGMENT = /^\.(ssh|gnupg|aws|kube|docker|claude.*|config|netrc|npmrc|env.*)$/i;
+
+const real = (p: string) => realpathSync(p);
+const inside = (dir: string, p: string) => {
+  const rel = relative(dir, p);
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+};
+const sensitive = (absReal: string) => {
+  const segs = absReal.split(sep);
+  if (segs.some((x) => SENSITIVE_SEGMENT.test(x))) return true;
+  // the bwalletx home itself (key files, settings) is off limits except the inbox under it
+  const bwx = existsSync(home()) ? real(home()) : resolve(home());
+  return (absReal === bwx || inside(bwx, absReal)) && !(existsSync(defaultMintDir()) && (absReal === real(defaultMintDir()) || inside(real(defaultMintDir()), absReal)));
+};
+
+/** Check (and create, for the default) the mint folder; returns its real path. */
+export function prepareMintDir(dir?: string): string {
+  const d = resolve(dir ?? defaultMintDir());
+  if (!dir) mkdirSync(d, { recursive: true, mode: 0o700 });
+  if (!existsSync(d) || !statSync(d).isDirectory()) throw new Error(`Mint folder ${d} does not exist`);
+  const r = real(d);
+  const homeReal = real(homedir());
+  if (r === sep || r === homeReal || inside(r, homeReal)) throw new Error(`Mint folder ${r} is too broad: use a folder just for files to mint`);
+  if (sensitive(r)) throw new Error(`Mint folder ${r} is inside a private folder (.ssh, .claude, the bwalletx keys…)`);
+  return r;
+}
+
+/** One MCP mint path → its real path, or a refusal. Relative paths are taken inside the mint folder. */
+export function resolveMintFile(file: string, dirReal: string): string {
+  const abs = resolve(dirReal, file);
+  if (basename(abs).startsWith('.')) throw new Error(`Refused: ${basename(abs)} is a dotfile`);
+  if (!existsSync(abs)) throw new Error(`Missing file: ${file}`);
+  const r = real(abs);
+  if (!inside(dirReal, r)) throw new Error(`Refused: ${file} is outside the mint folder ${dirReal} (after following links). Copy it into the folder to mint it.`);
+  const rel = relative(dirReal, r);
+  if (rel.split(sep).some((x) => x.startsWith('.'))) throw new Error(`Refused: ${file} is a dotfile or inside a hidden folder`);
+  if (sensitive(r)) throw new Error(`Refused: ${file} is in a private folder`);
+  if (!lstatSync(r).isFile()) throw new Error(`Refused: ${file} is not a regular file`);
+  return r;
+}
+
+/** Apply resolveMintFile to every item. */
+export const confineItems = (items: Item[], dirReal: string): Item[] => items.map((it) => ({ ...it, file: resolveMintFile(it.file, dirReal) }));
+
+/**
+ * Over MCP, more than MCP_MINT_CONFIRM_BYTES needs a dryRun of the same files first (this MCP session, 15 minutes)
+ * or confirm: true. Returns a refusal or null; records dry runs.
+ */
+export function mintSizeGate(items: Item[], o: { dryRun?: boolean; confirm?: boolean }, seen: Map<string, number>, now = Date.now()): string | null {
+  const bytes = items.reduce((s, it) => s + statSync(it.file).size, 0);
+  const key = items.map((it) => `${it.file}:${sha256(readFileSync(it.file))}`).sort().join('|');
+  if (o.dryRun) {
+    seen.set(key, now);
+    return null;
+  }
+  if (bytes <= MCP_MINT_CONFIRM_BYTES || o.confirm === true) return null;
+  const at = seen.get(key);
+  if (at !== undefined && now - at < 15 * 60_000) return null;
+  return `Refused: ${(bytes / 1048576).toFixed(1)} MB is over the ${MCP_MINT_CONFIRM_BYTES / 1048576} MB limit for MCP mints without a check. Run it with dryRun: true first (same files), or pass confirm: true.`;
 }

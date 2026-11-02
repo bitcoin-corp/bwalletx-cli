@@ -8,7 +8,7 @@ import { STAMP_TAG, registerStamp, stampScript, stampWith, stampedHash, verifySt
 
 const NOW = Date.now();
 const acct = (p: Partial<AccountConfig> = {}): AccountConfig => ({
-  name: 'bcorp', identityAddress: '1Id', payAddress: '1Pay', ordAddress: '1Ord', dailyCapUsd: null, stopped: false, importedAt: NOW - 1e7, ...p,
+  name: 'acme', identityAddress: '1Id', payAddress: '1Pay', ordAddress: '1Ord', dailyCapUsd: null, stopped: false, importedAt: NOW - 1e7, ...p,
 });
 const TXID = 'cd'.repeat(32);
 
@@ -26,7 +26,7 @@ const fakeWallet = () => {
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'bwx-stamp-'));
   process.env.BWALLETX_HOME = dir;
-  writeConfig({ accounts: { bcorp: acct() }, defaultAccount: 'bcorp' });
+  writeConfig({ accounts: { acme: acct() }, defaultAccount: 'acme' });
   setAllStopped(false);
 });
 
@@ -49,29 +49,29 @@ describe('bwalletx stamp: a file hash on chain, nothing else', () => {
     const { p, sha } = file();
     const { w, createAction } = fakeWallet();
     const register = join(dir, 'SEAL-REGISTER.md');
-    const r = await stampWith('bcorp', w, p, { rate: 50, register, now: () => new Date('2026-11-02T06:00:00Z') });
-    expect(r).toEqual({ file: 'receipt.pdf', sha256: sha, txid: TXID, account: 'bcorp', timestamp: '2026-11-02T06:00:00.000Z' });
+    const r = await stampWith('acme', w, p, { rate: 50, register, now: () => new Date('2026-11-02T06:00:00Z') });
+    expect(r).toEqual({ file: 'receipt.pdf', sha256: sha, txid: TXID, account: 'acme', timestamp: '2026-11-02T06:00:00.000Z' });
     const outputs = createAction.mock.calls[0][0].outputs;
     expect(outputs).toHaveLength(1);
     expect(outputs[0].satoshis).toBe(0);
     expect(stampedHash(outputs[0].lockingScript)).toBe(sha);
     const reg = readFileSync(register, 'utf8');
     expect(reg).toContain('| Time (UTC) | File | SHA-256 | Txid | Account |');
-    expect(reg).toContain(`| 2026-11-02T06:00:00.000Z | receipt.pdf | ${sha} | ${TXID} | bcorp |`);
+    expect(reg).toContain(`| 2026-11-02T06:00:00.000Z | receipt.pdf | ${sha} | ${TXID} | acme |`);
   });
 
   test('goes through the spending gate: a stopped wallet never signs', async () => {
     const { p } = file();
     const { w, createAction } = fakeWallet();
     setAllStopped(true);
-    await expect(stampWith('bcorp', w, p, { rate: 50 })).rejects.toThrow(/Refused/);
+    await expect(stampWith('acme', w, p, { rate: 50 })).rejects.toThrow(/Refused/);
     expect(createAction).not.toHaveBeenCalled();
   });
 
   test('a register with existing rows only gets a new row', () => {
     const register = join(dir, 'SEAL-REGISTER.md');
     writeFileSync(register, '# Seal register\n\n| Time (UTC) | File | SHA-256 | Txid | Account |\n|---|---|---|---|---|\n| old |\n');
-    registerStamp(register, { file: 'a|b.pdf', sha256: 'ee'.repeat(32), txid: TXID, account: 'bcorp', timestamp: 't' });
+    registerStamp(register, { file: 'a|b.pdf', sha256: 'ee'.repeat(32), txid: TXID, account: 'acme', timestamp: 't' });
     const lines = readFileSync(register, 'utf8').trim().split('\n');
     expect(lines.at(-2)).toBe('| old |');
     expect(lines.at(-1)).toContain('a\\|b.pdf');

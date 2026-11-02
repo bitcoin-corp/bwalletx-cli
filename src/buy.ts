@@ -4,7 +4,7 @@
  *   inputs 1+ P2PKH funding from the account's pay key
  *   output 0  1-sat BSV-21 transfer inscription of the listed amount to the buyer's ord address
  *   output 1  the seller payout, byte-for-byte as encoded in the lock
- *   output 2  bWalletX marketplace fee (1%, ceil) to the bCorp fee address
+ *   output 2  bWalletX marketplace fee (1%, ceil) to the bWalletX marketplace fee address
  *   output 3  overlay processing fee, when the token's 1Sat overlay is active (as the app does)
  *   last      change to the pay address
  * Nothing is broadcast unless verifyPurchase passes: every input's script is executed locally (Spend).
@@ -12,7 +12,7 @@
 import { BSV21, OrdLock, OrdLockV2 } from '@1sat/templates';
 import { LockingScript, P2PKH, PrivateKey, SatoshisPerKilobyte, Spend, Transaction, Utils } from '@bsv/sdk';
 
-/** bCorp fee address (public receive address) and rate: same as the app's Market tab (src/mobile/market/fee.ts). */
+/** bWalletX marketplace fee address (public receive address) and rate: same as the app's Market tab (src/mobile/market/fee.ts). */
 export const MARKET_FEE_ADDRESS = '192nuX6cz81MH3T2gwsam3FxYoDrvzDYpU';
 export const MARKET_FEE_RATE = 0.01;
 export const marketFeeSats = (payoutSats: number, rate = MARKET_FEE_RATE) => Math.ceil(payoutSats * rate);

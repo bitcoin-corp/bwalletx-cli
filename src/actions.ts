@@ -253,6 +253,9 @@ async function buyLocked(a: AccountConfig, id: string, maxUsd: number, now: numb
   const priceUsd = (pick.pricePerTokenSats / 1e8) * rate;
   const g = gateAction(a.name, { kind: 'buy', token: id, ticker, usd, priceUsd, amount: pick.tokens }, {}, now);
   if (!g.ok) return { ok: false, text: `Refused: ${g.reason}` };
+  // The gate re-reads the strategy: if it is paper now (the file changed while we were picking a listing), the
+  // gate skipped the live checks (cap, approve-above), so never sign on that answer.
+  if (g.paper) return { ok: false, text: 'Refused: the strategy is in paper mode now; nothing signed' };
   const rule = loaded?.strategy.name;
   // Set once the signed purchase is handed to a broadcaster: a failure after that may still have spent.
   let handedOut = false;
