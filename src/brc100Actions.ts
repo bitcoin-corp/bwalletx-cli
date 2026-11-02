@@ -31,7 +31,9 @@ export async function brc100Fund(account?: string, shared = false) {
   try {
     const r = await b.fundFromPayAddress(w, keys);
     appendLog(name, { at: Date.now(), action: 'brc100-fund', detail: `Moved ${r.moved} coins (${r.sats} sats) into the BRC-100 wallet`, usd: 0 });
-    return { name, payAddress: w.payAddress, result: r };
+    // The toolbox's broadcast can fail quietly (2 Nov 2026: TAAL 401, a timeout): hand anything still unsent to ARC now.
+    const repaired = w.db ? await (await import('./repair.js')).repairWallet(w.db) : undefined;
+    return { name, payAddress: w.payAddress, result: r, ...(repaired && { broadcast: repaired.rebroadcast }) };
   } finally {
     await w.close();
   }
@@ -133,5 +135,24 @@ export async function serveStatus(port = 3321, timeoutMs = 1500) {
     return { port, listening: true, status: r.status };
   } catch {
     return { port, listening: false };
+  }
+}
+
+/** `bwalletx repair`: re-broadcast unsent txs to ARC and free inputs that failed, never-broadcast actions locked. */
+export async function brc100Repair(account?: string) {
+  const { name, w } = await brc100Account(account);
+  try {
+    if (!w.db) throw new Error('This wallet has no local storage to repair');
+    const { repairWallet } = await import('./repair.js');
+    const report = await repairWallet(w.db);
+    appendLog(name, {
+      at: Date.now(),
+      action: 'repair',
+      detail: `rebroadcast ${report.rebroadcast.filter((x) => x.ok).length}/${report.rebroadcast.length}, freed ${report.freed.length} outputs`,
+      usd: 0,
+    });
+    return { account: name, ...report };
+  } finally {
+    await w.close();
   }
 }
