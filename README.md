@@ -86,6 +86,7 @@ bwalletx cap trader 10                            # optional $10/day cap ("off" 
 bwalletx mcp                                      # stdio MCP server
 bwalletx stamp ./SH01-receipt.pdf -a bcorp --register ./treasury/SEAL-REGISTER.md   # file's SHA-256 on chain, prints the txid
 bwalletx verify ./SH01-receipt.pdf <txid>         # does that tx carry this file's SHA-256? (exit 1 if not)
+bwalletx paymail register bstamp -a bstamp       # claim bstamp@bwalletx.com for an agent account (signed by its key)
 ```
 
 ### Stamps (`stamp` / `verify`)

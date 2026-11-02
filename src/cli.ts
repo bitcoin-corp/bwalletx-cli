@@ -518,6 +518,26 @@ brc
     }),
   );
 
+const pm = program.command('paymail').description('name@bwalletx.com for an agent account');
+pm.command('register <alias>')
+  .description("claim <alias>@bwalletx.com for an agent key-file account (signed by its identity key; 5+ characters are free)")
+  .option('-a, --account <name>', 'agent account')
+  .action(
+    run(async (alias: string, o: { account?: string }) => {
+      const { readConfig, resolveAccount } = await import('./store.js');
+      const { isPaired } = await import('./paired.js');
+      const { unlock } = await import('./actions.js');
+      const { registerPaymail } = await import('./paymail.js');
+      const n = o.account ?? readConfig().defaultAccount ?? Object.keys(readConfig().accounts)[0];
+      if (!n) throw new Error('No accounts yet.');
+      if (isPaired(n)) throw new Error(`"${n}" is paired: its keys stay on the phone; claim the paymail in the app.`);
+      const acct = resolveAccount(n);
+      const keys = await unlock(n);
+      const paymail = await registerPaymail(keys.identityPk, alias, acct.ordAddress);
+      print({ account: n, paymail }, () => `${n}: ${paymail}`);
+    }),
+  );
+
 program
   .command('repair')
   .description("after a failed broadcast: re-send the wallet's unsent txs to ARC (with their parents) and free coins that failed, never-broadcast actions locked (checked unspent on chain)")
