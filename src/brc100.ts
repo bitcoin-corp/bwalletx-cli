@@ -411,8 +411,6 @@ export type ServeOptions = {
   maxUsdPerAction?: number;
   /** Most this serve session may move in total, in USD. Default SERVE_SESSION_BUDGET_USD. */
   sessionBudgetUsd?: number;
-  /** Allow `--origin '*'` (any web page on this machine can drive the wallet). Off by default. */
-  allowAnyOrigin?: boolean;
   /**
    * Let sites move tokens/ordinals: createActions with BSV-20/21 inscribed outputs or that name the
    * wallet's own outputs as inputs. Off by default: the caps value satoshis only, and a token output
@@ -461,11 +459,13 @@ export const isAuthProtocolCall = (call: string, args: unknown) => {
 export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
   const w: ServeWallet = 'call' in input ? input : localBackend(input);
   const allowed = new Set(o.origins.map(hostOf));
-  if (allowed.has('*') && !o.allowAnyOrigin) throw new Error("bwalletx serve: --origin '*' lets any web page spend from this wallet; name the sites instead (or pass --allow-any-origin)");
+  // No wildcards, ever (0.6.0): '*' (or '*.example') would let any web page on this machine drive the wallet.
+  if ([...allowed].some((h) => !h || h.includes('*'))) throw new Error("bwalletx serve: wildcard origins like '*' are not allowed; name each site (e.g. --origin www.example.com localhost:3000)");
+  if (!allowed.size) throw new Error('bwalletx serve: name at least one site with --origin');
   const maxPerAction = o.maxUsdPerAction ?? SERVE_MAX_USD_PER_ACTION;
   const budget = o.sessionBudgetUsd ?? SERVE_SESSION_BUDGET_USD;
   let sessionSpentUsd = 0;
-  const singleSite = allowed.size === 1 && !allowed.has('*');
+  const singleSite = allowed.size === 1;
   const say = o.onEvent ?? (() => undefined);
   const arc = o.arc ?? relayToArc;
   const price = o.usdPerBsv ?? bsvUsd;
@@ -496,7 +496,7 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
     }
     const origin = String(req.headers.origin ?? req.headers.originator ?? '');
     const host = hostOf(origin);
-    const ok = host && (allowed.has(host) || allowed.has('*'));
+    const ok = host && allowed.has(host);
     if (req.method === 'OPTIONS') {
       res.writeHead(ok ? 204 : 403, {
         ...(ok && {

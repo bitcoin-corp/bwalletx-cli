@@ -5,6 +5,12 @@ export async function getPassphrase(prompt = 'Passphrase: '): Promise<string> {
   const env = process.env.BWALLETX_PASSPHRASE;
   if (env) return env;
   if (!process.stdin.isTTY) throw new Error('No passphrase: set BWALLETX_PASSPHRASE or run in a terminal');
+  return hiddenPrompt(prompt);
+}
+
+/** A hidden prompt on the terminal, never from env or arguments (the owner PIN uses only this). */
+export async function hiddenPrompt(prompt: string): Promise<string> {
+  if (!process.stdin.isTTY) throw new Error('No terminal to ask in');
   return new Promise((resolve) => {
     const rl = createInterface({ input: process.stdin, output: process.stderr, terminal: true });
     const out = rl as unknown as { _writeToOutput: (s: string) => void; output: NodeJS.WriteStream };

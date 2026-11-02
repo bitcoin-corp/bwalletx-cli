@@ -6,7 +6,7 @@ import type { MintStepResult } from './opnsMint.js';
 
 /**
  * Local mine-tree cache (bug 13 Oct 2026). The indexer (api.1sat.app opns/mine, opns/origin) only knows
- * CONFIRMED names, so after minting b0a → b0as → b0ase (all unconfirmed) a lookup for b0asex still
+ * CONFIRMED names, so after minting abc → abcd → abcde (all unconfirmed) a lookup for abcdef still
  * returned node "b0" — already spent by our own mempool tx — and the wallet refused the double-spend
  * (WERR_REVIEW_ACTIONS). Every successful mint step is recorded here: the child node (prefix + char,
  * output 1), the restated parent node (output 0), the BEEF with its unconfirmed ancestry, and the

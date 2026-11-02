@@ -1,10 +1,11 @@
 /**
  * `bwalletx mcp`: stdio MCP server exposing the same operations, through the same gate.
  *
- * Human-only (never exposed here, by design): `cap` changes, `resume`, `strategy load --live`, `key import`,
- * `pair` / `login` / `logout`, `brc100 migrate`, and starting/stopping `serve`. These change safety settings,
- * trust or key material, or need a person at the terminal/phone; an agent may stop things (`stop_all`) but
- * never loosen them.
+ * Human-only (never exposed here, by design): raising/clearing caps, rate limits or approve-above, `resume`,
+ * `strategy load --live`, `key import`, `pair` / `login` / `logout`, `brc100 migrate`, and starting/stopping
+ * `serve`. Since 0.6.0 being off MCP is not the only guard: the CLI commands themselves need the owner PIN at an
+ * interactive terminal (ownerGate.ts), and this process marks itself so any of them run from here are refused.
+ * An agent may tighten things (`stop_all`, `lower_cap`) but never loosen them.
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -14,7 +15,8 @@ import * as b1 from './brc100Actions.js';
 import * as mint from './mint.js';
 import * as sell from './sell.js';
 import * as storeBuy from './storeBuy.js';
-import { allStopped, appendLog, getLoaded, mcpMaxUsdPerCall, readConfig, resolveAccount, setAllStopped } from './store.js';
+import { allStopped, getLoaded, mcpMaxUsdPerCall, resolveAccount } from './store.js';
+import { lowerCap, markUnderMcp, stopAllAgents } from './ownerGate.js';
 
 const json = (v: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(v, null, 2) }] });
 const wrap =
@@ -27,7 +29,22 @@ const wrap =
     }
   };
 
-export async function runMcp(version: string) {
+export type McpOptions = { mintDir?: string };
+
+export async function runMcp(version: string, o: McpOptions = {}) {
+  const server = createMcpServer(version, o);
+  await server.connect(new StdioServerTransport());
+}
+
+/** The MCP server with every tool registered (no transport), so tests can drive it in memory. */
+export function createMcpServer(version: string, opts: McpOptions = {}) {
+  markUnderMcp();
+  const mintDir = mint.prepareMintDir(opts.mintDir);
+  const mintDryRuns = new Map<string, number>();
+  const overLimit = (usd: number, what: string) => {
+    const max = mcpMaxUsdPerCall();
+    return usd > max + 1e-9 ? { ok: false, text: `Refused: $${usd} is over the $${max} per-call limit for MCP ${what} (BWALLETX_MCP_MAX_USD)` } : null;
+  };
   const server = new McpServer({ name: 'bwalletx', version });
   const account = z.string().optional().describe('Account name (default: the default account)');
 
@@ -49,20 +66,18 @@ export async function runMcp(version: string) {
         'Send BSV worth `usd` dollars to an address or paymail. Gated: per-call limit (BWALLETX_MCP_MAX_USD, default $5), kill switch, daily cap, rate limit, strategy rules (token "BSV" and sendTo must allow it). Paper mode never signs. Live needs BWALLETX_PASSPHRASE in the server env (key-file accounts) or a paired phone with bWalletX open.',
       inputSchema: { usd: z.number().positive(), to: z.string(), account },
     },
-    wrap(({ usd, to, account: a }: { usd: number; to: string; account?: string }) => {
-      const max = mcpMaxUsdPerCall();
-      if (usd > max + 1e-9) return { ok: false, text: `Refused: $${usd} is over the $${max} per-call limit for MCP sends (BWALLETX_MCP_MAX_USD)` };
-      return act.send(usd, to, a);
-    }),
+    wrap(({ usd, to, account: a }: { usd: number; to: string; account?: string }) => overLimit(usd, 'sends') ?? act.send(usd, to, a)),
   );
   server.registerTool(
     'buy',
     {
       description:
-        'Buy a BSV-21 token for at most maxUsd: the cheapest whole buyable 1Sat listing that fits, plus the 1% bWalletX market fee. Gated like send. Paper mode fills on the paper book; live signs and broadcasts (key-file accounts need BWALLETX_PASSPHRASE; paired accounts are signed on the phone).',
+        'Buy a BSV-21 token for at most maxUsd: the cheapest whole buyable 1Sat listing that fits, plus the 1% bWalletX market fee. Gated like send, including the per-call limit (BWALLETX_MCP_MAX_USD, default $5). Paper mode fills on the paper book; live signs and broadcasts (key-file accounts need BWALLETX_PASSPHRASE; paired accounts are signed on the phone).',
       inputSchema: { tokenId: z.string(), maxUsd: z.number().positive(), account },
     },
     wrap(async ({ tokenId, maxUsd, account: a }: { tokenId: string; maxUsd: number; account?: string }) => {
+      const refused = overLimit(maxUsd, 'buys');
+      if (refused) return refused;
       const name = resolveAccount(a).name;
       const paired = resolveAccount(a).kind === 'paired'; // the phone signs: no passphrase here
       if (!paired && getLoaded(name)?.mode !== 'paper' && !process.env.BWALLETX_PASSPHRASE) return { ok: false, text: 'Live buy needs BWALLETX_PASSPHRASE in the MCP server env' };
@@ -95,10 +110,15 @@ export async function runMcp(version: string) {
     'buy_listing',
     {
       description:
-        'Buy one 1Sat listing (ordinal or BSV-21) by its outpoint with the account\'s BRC-100 wallet, like `bwalletx buy-listing`: seller price + 1% bWalletX market fee (+ overlay fee for tokens). Gated like buy; maxUsd refuses anything dearer. dryRun builds only.',
+        'Buy one 1Sat listing (ordinal or BSV-21) by its outpoint with the account\'s BRC-100 wallet, like `bwalletx buy-listing`: seller price + 1% bWalletX market fee (+ overlay fee for tokens). Gated like buy; maxUsd (default and at most the per-call limit, BWALLETX_MCP_MAX_USD, $5) refuses anything dearer. dryRun builds only.',
       inputSchema: { outpoint, maxUsd: z.number().positive().optional(), account, dryRun },
     },
-    wrap(async (o: { outpoint: string; maxUsd?: number; account?: string; dryRun?: boolean }) => needPass(o.dryRun) ?? sell.buyListing(o)),
+    wrap(async (o: { outpoint: string; maxUsd?: number; account?: string; dryRun?: boolean }) => {
+      const max = mcpMaxUsdPerCall();
+      const refused = o.maxUsd !== undefined ? overLimit(o.maxUsd, 'buys') : null;
+      if (refused) return refused;
+      return needPass(o.dryRun) ?? sell.buyListing({ ...o, maxUsd: o.maxUsd ?? max });
+    }),
   );
   server.registerTool(
     'strategy_show',
@@ -120,12 +140,19 @@ export async function runMcp(version: string) {
   );
   server.registerTool(
     'stop_all',
-    { description: 'Kill switch: stop every agent account. Every spending action is refused until a human runs `bwalletx resume`.' },
+    { description: 'Kill switch: stop every agent account. Every spending action is refused until the owner runs `bwalletx resume` (with the owner PIN, in a terminal).' },
     wrap(() => {
-      setAllStopped(true);
-      for (const n of Object.keys(readConfig().accounts)) appendLog(n, { at: Date.now(), action: 'stop', detail: 'All agents stopped (MCP)', usd: 0 });
+      stopAllAgents('MCP');
       return { stopped: true };
     }),
+  );
+  server.registerTool(
+    'lower_cap',
+    {
+      description: "Lower an account's daily cap (USD per UTC day). Lowering only: raising or clearing a cap is an owner step (`bwalletx cap`, owner PIN, in a terminal).",
+      inputSchema: { usdPerDay: z.number().positive(), account },
+    },
+    wrap(({ usdPerDay, account: a }: { usdPerDay: number; account?: string }) => ({ ok: true, text: lowerCap(resolveAccount(a).name, usdPerDay) })),
   );
 
   const wallet = z.enum(['local', 'shared']).optional().describe("local (default): the CLI's own BRC-100 wallet; shared: the account's 1Sat Storage wallet (only if the app uses it as active storage)");
@@ -179,33 +206,41 @@ export async function runMcp(version: string) {
     collectionId: z.string().optional().describe('Add to an existing collection of yours (<txid>_<vout>)'),
     description: z.string().optional().describe('Description for every item'),
     dryRun: z.boolean().optional().describe('Sizes and cost estimate only; nothing is sent'),
+    confirm: z.boolean().optional().describe(`Needed for more than ${mint.MCP_MINT_CONFIRM_BYTES / 1048576} MB unless the same files had a dryRun in the last 15 minutes`),
   };
-  type MintArgs = { account?: string; collection?: string; collectionId?: string; description?: string; dryRun?: boolean };
+  type MintArgs = { account?: string; collection?: string; collectionId?: string; description?: string; dryRun?: boolean; confirm?: boolean };
   const mintGate = (o: MintArgs) => (!o.dryRun && allStopped() ? 'Refused: all agents are stopped (bwalletx resume)' : null);
   server.registerTool(
     'mint',
     {
       description:
-        'Mint files (paths on this machine) as NFTs on a paired phone, like `bwalletx mint`. The phone signs within the mint limits chosen when pairing (items and USD); refused while all agents are stopped. Key-file accounts cannot mint.',
+        `Mint files as NFTs (public, on chain) on a paired phone, like \`bwalletx mint\`. Only files inside the mint folder (${mintDir}) can be minted: paths are relative to it; anything outside it after following links, dotfiles and hidden folders are refused. Over ${mint.MCP_MINT_CONFIRM_BYTES / 1048576} MB needs a dryRun first or confirm: true. The phone signs within the mint limits chosen when pairing (items and USD); refused while all agents are stopped. Key-file accounts cannot mint.`,
       inputSchema: { files: z.array(z.string()).min(1), title: z.string().optional().describe('Title (one file only)'), titleFromFilename: z.boolean().optional(), ...mintOpts },
     },
     wrap(async (o: MintArgs & { files: string[]; title?: string; titleFromFilename?: boolean }) => {
       const refused = mintGate(o);
       if (refused) return { ok: false, text: refused };
-      return mint.runMint(mint.itemsFor(o.files, o), { account: o.account, collection: mint.collectionOf(o), description: o.description, dryRun: o.dryRun, out: () => {} });
+      const items = mint.confineItems(mint.itemsFor(o.files, o), mintDir);
+      const big = mint.mintSizeGate(items, o, mintDryRuns);
+      if (big) return { ok: false, text: big };
+      return mint.runMint(items, { account: o.account, collection: mint.collectionOf(o), description: o.description, dryRun: o.dryRun, out: () => {} });
     }),
   );
   server.registerTool(
     'mint_manifest',
     {
-      description: 'Mint every entry of a manifest file ([{ title, file, sha256? }]) in order on a paired phone, like `bwalletx mint-manifest`; resumable via <manifest>.progress.json. Same limits as mint.',
+      description: `Mint every entry of a manifest file ([{ title, file, sha256? }]) in order on a paired phone, like \`bwalletx mint-manifest\`; resumable via <manifest>.progress.json. The manifest and every file in it must be inside the mint folder (${mintDir}). Same limits as mint.`,
       inputSchema: { manifest: z.string(), ...mintOpts },
     },
     wrap(async (o: MintArgs & { manifest: string }) => {
       const refused = mintGate(o);
       if (refused) return { ok: false, text: refused };
-      const progressPath = mint.progressPathFor(o.manifest);
-      const r = await mint.runMint(mint.readManifest(o.manifest), { account: o.account, collection: mint.collectionOf(o), description: o.description, dryRun: o.dryRun, progressPath, out: () => {} });
+      const manifest = mint.resolveMintFile(o.manifest, mintDir);
+      const items = mint.confineItems(mint.readManifest(manifest), mintDir);
+      const big = mint.mintSizeGate(items, o, mintDryRuns);
+      if (big) return { ok: false, text: big };
+      const progressPath = mint.progressPathFor(manifest);
+      const r = await mint.runMint(items, { account: o.account, collection: mint.collectionOf(o), description: o.description, dryRun: o.dryRun, progressPath, out: () => {} });
       return o.dryRun ? r : { ...r, progressPath };
     }),
   );
@@ -231,11 +266,7 @@ export async function runMcp(version: string) {
         'Buy a Store product from the account\'s BRC-100 wallet: quote → check (price within maxUsd, sats match our BSV rate) → gate → the server checks the payment and broadcasts → granted to this identity key, with a Store receipt. Gated like send: per-call limit (BWALLETX_MCP_MAX_USD, default $5, so the $99 edition needs it raised), kill switch, daily cap, rate limit, strategy rules; paper mode refuses. dryRun quotes and builds only. Named buy_product because `buy` is the BSV-21 token buy.',
       inputSchema: { product, fields: productFields, maxUsd: z.number().positive(), account, dryRun },
     },
-    wrap(async (o: { product: storeBuy.Product; fields?: Record<string, unknown>; maxUsd: number; account?: string; dryRun?: boolean }) => {
-      const max = mcpMaxUsdPerCall();
-      if (o.maxUsd > max + 1e-9) return { ok: false, text: `Refused: $${o.maxUsd} is over the $${max} per-call limit for MCP spends (BWALLETX_MCP_MAX_USD)` };
-      return needPass(o.dryRun) ?? storeBuy.buy(o);
-    }),
+    wrap(async (o: { product: storeBuy.Product; fields?: Record<string, unknown>; maxUsd: number; account?: string; dryRun?: boolean }) => overLimit(o.maxUsd, 'spends') ?? needPass(o.dryRun) ?? storeBuy.buy(o)),
   );
   server.registerTool(
     'pairing_status',
@@ -247,6 +278,5 @@ export async function runMcp(version: string) {
     { description: 'Whether something is listening on the `bwalletx serve` BRC-100 port (default 3321) (read-only). Starting/stopping serve is a human step.', inputSchema: { port: z.number().int().positive().max(65535).optional() } },
     wrap(({ port }: { port?: number }) => b1.serveStatus(port ?? 3321)),
   );
-
-  await server.connect(new StdioServerTransport());
+  return server;
 }

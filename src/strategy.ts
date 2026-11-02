@@ -263,7 +263,7 @@ export const paperFill = (book: PaperBook, a: ActionRequest): { ok: true; book: 
 };
 
 /** A starting file for "New strategy": buys a token slowly while it's cheap. */
-export const exampleStrategy = (token = 'B0ASEX'): Strategy => ({
+export const exampleStrategy = (token = 'EXAMPLE'): Strategy => ({
   format: STRATEGY_FORMAT,
   name: 'Slow accumulator',
   version: '1.0',

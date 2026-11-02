@@ -6,8 +6,6 @@
  * wallet app does (bWalletX src/mobile/names/paymail.ts). It also takes a standing 'ord' proof tying the account's
  * ordinal address to the key. Nothing secret leaves this machine; the server learns only public keys. Names of 5+
  * characters are free (paid tiers are for 1-4 characters); the server says so if a fee is due.
- *
- * First use, 2 Nov 2026: bstamp@bwalletx.com for the company stamping account (owner OK, via the CEO session).
  */
 import { randomBytes } from 'node:crypto';
 import { PrivateKey, ProtoWallet, Utils } from '@bsv/sdk';

@@ -1,9 +1,8 @@
 /**
  * `bwalletx stamp <file>` and `bwalletx verify <file> <txid>`: put a file's SHA-256 on chain, and check it later.
  *
- * Owner approved, 2 Nov 2026 (asked for by the CEO session: bCorp is an on-chain corporation by default; every
- * company record is hashed and timestamped through bWalletX and its txid goes in SEAL-REGISTER.md). Only the hash goes
- * on chain, in one 0-sat OP_RETURN output:
+ * Use it to timestamp records (receipts, minutes, contracts): the file's hash goes on chain and its txid can be kept
+ * in a Markdown register (`--register`). Only the hash goes on chain, in one 0-sat OP_RETURN output:
  *
  *   OP_FALSE OP_RETURN "bwx.stamp/1" <32-byte sha256>
  *
@@ -92,7 +91,7 @@ export function stampWith(
   });
 }
 
-/** Append a row to a SEAL-REGISTER.md-style table, creating the file with its header if missing. */
+/** Append a row to a Markdown register table, creating the file with its header if missing. */
 export function registerStamp(path: string, s: StampResult) {
   if (!existsSync(path))
     writeFileSync(path, '# Seal register\n\n| Time (UTC) | File | SHA-256 | Txid | Account |\n|---|---|---|---|---|\n');

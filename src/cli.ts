@@ -9,7 +9,8 @@ import * as b1 from './brc100Actions.js';
 import { login, unpair } from './paired.js';
 import { agentRun } from './agent.js';
 import { confirm } from './passphrase.js';
-import { keyFilePath, allStopped, appendLog, readConfig, resolveAccount, setAllStopped, updateAccount, writeConfig } from './store.js';
+import { keyFilePath, allStopped, readConfig, resolveAccount, writeConfig, appendLog } from './store.js';
+import * as og from './ownerGate.js';
 
 const VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
 
@@ -43,8 +44,10 @@ program
   .option('-a, --account <name>', 'local name for this paired account', 'phone')
   .action(
     run(async (o: { account: string }) => {
+      const owner = await og.requireOwner(`pair a phone account as "${o.account}"`);
       if (!asJson) await banner();
       const p = await login(o.account, {});
+      og.approveNewAccount(owner, p.name);
       console.log(`\nPaired "${p.name}" with ${p.account}: ${p.scopes.join(', ')} until ${new Date(p.expiresAt).toLocaleDateString()}.`);
       console.log('Keep bWalletX open on that account while the CLI works. Try: bwalletx balance --account ' + p.name);
     }),
@@ -57,8 +60,10 @@ program
   .option('-a, --account <name>', 'local name for this pairing', 'main')
   .action(
     run(async (o: { account: string }) => {
+      const owner = await og.requireOwner(`pair your main wallet as "${o.account}"`);
       if (!asJson) await banner();
       const p = await login(o.account, { mode: 'brc100' });
+      og.approveNewAccount(owner, p.name);
       console.log(`\nPaired "${p.name}" with ${p.account} as your main wallet until ${new Date(p.expiresAt).toLocaleDateString()}.`);
       console.log(`Serve it to sites: bwalletx serve --wallet paired --account ${p.name} --origin <site>. Revoke: bwalletx logout --account ${p.name}`);
     }),
@@ -76,7 +81,9 @@ key
   .description('import an agent account key file exported by bWalletX (bwalletx.agentkey/1)')
   .action(
     run(async (file: string) => {
+      const owner = await og.requireOwner(`import the key file ${file}`);
       const a = await act.importKey(file);
+      og.approveNewAccount(owner, a.name);
       print(a, () => `Imported "${a.name}"\n  pay address: ${a.payAddress}\n  ord address: ${a.ordAddress}\n  stored: ${keyFilePath(a.name)} (encrypted, mode 600)`);
     }),
   );
@@ -88,7 +95,9 @@ key
   .action(
     run(async (name: string, o: { out: string }) => {
       const out = o.out === '<name>.key.json' ? `${name}.key.json` : o.out;
+      const owner = await og.requireOwner(`make a new agent account "${name}"`);
       const a = await act.newKey(name, out, process.env.BWALLETX_PASSPHRASE || undefined);
+      og.approveNewAccount(owner, a.name);
       print(a, () => `Made "${a.name}"\n  identity key: ${a.identityKey}\n  pay address: ${a.payAddress}\n  ord address: ${a.ordAddress}\n  key file: ${out} (keep it; it is the only copy of these keys)\n  stored: ${keyFilePath(a.name)} (encrypted, mode 600)`);
     }),
   );
@@ -153,40 +162,50 @@ program
 
 program
   .command('approve-above <account> <usd>')
-  .description('refuse single spends above this many USD until the owner approves them ("off" to clear)')
-  .action(
-    run((name: string, v: string) => {
-      resolveAccount(name);
-      const t = v === 'off' ? null : Number(v);
-      if (t !== null && !(t >= 0)) throw new Error('Threshold must be a number of USD (0 or more) or "off"');
-      updateAccount(name, { approveAboveUsd: t });
-      console.log(t !== null ? `${name}: spends over $${t} need owner approval` : `${name}: no approval threshold`);
-    }),
-  );
+  .description('refuse single spends above this many USD until the owner approves them ("off" to clear; raising or clearing needs the owner PIN)')
+  .action(run(async (name: string, v: string) => console.log(await og.setApproveAbove(name, v))));
 
 program
   .command('ratelimit <account> <perHour>')
-  .description('spending actions per hour for one account (a number, "off" = no limit, "default" = 30)')
-  .action(
-    run((name: string, v: string) => {
-      resolveAccount(name);
-      const n = v === 'off' ? 0 : v === 'default' ? null : Number(v);
-      if (n !== null && !(Number.isInteger(n) && n >= 0)) throw new Error('Rate must be a whole number, "off" or "default"');
-      updateAccount(name, { ratePerHour: n });
-      console.log(n === 0 ? `${name}: no rate limit` : n ? `${name}: at most ${n} spending actions per hour` : `${name}: default rate limit`);
-    }),
-  );
+  .description('spending actions per hour for one account (a number, "off" = no limit, "default" = 30; raising needs the owner PIN)')
+  .action(run(async (name: string, v: string) => console.log(await og.setRateLimit(name, v))));
 
 program
   .command('cap <account> <usdPerDay>')
-  .description('set an account daily cap in USD ("off" to clear)')
+  .description('set an account daily cap in USD ("off" to clear; lowering is free, raising or clearing needs the owner PIN)')
+  .action(run(async (name: string, v: string) => console.log(await og.setCap(name, v))));
+
+const owner = program.command('owner').description('the owner PIN that guards every loosening of a safety setting');
+owner
+  .command('setup')
+  .description('set the owner PIN (once) and sign your current settings; run it in your own terminal')
+  .action(run(async () => void (await og.setupOwner())));
+owner
+  .command('change')
+  .description('change the owner PIN (asks for the old one)')
+  .action(run(async () => console.log(await og.ownerChange())));
+owner
+  .command('sign')
+  .description('review the limits in config.json and sign them as the owner (owner PIN)')
+  .action(run(async () => console.log(await og.ownerSign())));
+owner
+  .command('status')
+  .description('whether a PIN is set, whether the signed settings check out, and the limits the gate enforces')
   .action(
-    run((name: string, v: string) => {
-      resolveAccount(name);
-      const cap = v === 'off' ? null : Number(v);
-      if (cap !== null && !(cap > 0)) throw new Error('Cap must be a positive number or "off"');
-      updateAccount(name, { dailyCapUsd: cap });
-      console.log(cap ? `${name}: daily cap $${cap}` : `${name}: no daily cap`);
+    run(() => {
+      const s = og.ownerStatus();
+      const lim = (e: { dailyCapUsd: number | null; ratePerHour: number; approveAboveUsd: number | null; stopped: boolean }) =>
+        `cap ${e.dailyCapUsd == null ? 'none' : `$${e.dailyCapUsd}/day`}, ${e.ratePerHour === 0 ? 'no rate limit' : `${e.ratePerHour}/hour`}, approve above ${e.approveAboveUsd == null ? 'none' : `$${e.approveAboveUsd}`}${e.stopped ? ', STOPPED' : ''}`;
+      print(s, () =>
+        [
+          `owner PIN: ${s.pin}${'why' in s && s.why ? ` (${s.why})` : ''}`,
+          `kill switch: ${s.stopped ? 'ON (everything refused)' : 'off'}`,
+          ...s.accounts.map((a) => `  ${a.name}: ${lim(a.effective)}${a.strategy ? `; strategy "${a.strategy.name}" (${a.strategy.mode}${a.strategy.mode === 'live' ? (a.strategy.approved ? ', approved' : ', NOT approved: refused') : ''})` : ''}`),
+          s.state === 'unset' ? 'Set a PIN with `bwalletx owner setup`. Until then the defaults apply ($10/day, 30/hour, strategies on paper).' : '',
+        ]
+          .filter(Boolean)
+          .join('\n'),
+      );
     }),
   );
 
@@ -384,8 +403,10 @@ strategy
   .option('--live', 'run live with real money (default: paper, $100 pretend book)')
   .action(
     run(async (file: string, o: { account?: string; live?: boolean }) => {
-      if (o.live && !process.env.BWALLETX_YES && !(await confirm('Load this strategy LIVE (real money)?'))) throw new Error('Not confirmed (set BWALLETX_YES=1 to skip)');
+      // Live = real money: the owner PIN at a terminal (BWALLETX_YES does not skip it). Paper needs nothing.
+      const owner = o.live ? await og.requireOwner(`load ${file} LIVE (real money) into ${resolveAccount(o.account).name}`) : null;
       const r = await act.strategyLoad(file, o.account, !!o.live);
+      if (owner && r.mode === 'live') og.approveLiveStrategy(owner, r.account);
       print(r, () => `Loaded "${r.strategy.name}" v${r.strategy.version} into ${r.account} (${r.mode}${r.mode === 'paper' ? ', $100 paper book' : ''})`);
     }),
   );
@@ -420,11 +441,6 @@ program
     }),
   );
 
-const stopAll = (on: boolean) => () => {
-  setAllStopped(on);
-  for (const n of Object.keys(readConfig().accounts)) appendLog(n, { at: Date.now(), action: on ? 'stop' : 'resume', detail: on ? 'All agents stopped' : 'All agents resumed', usd: 0 });
-  console.log(on ? 'All agents stopped. Every spending action is refused until `bwalletx resume`.' : allStopped() ? 'Still stopped?' : 'Resumed.');
-};
 program
   .command('sync')
   .description("fetch merkle proofs for the agent wallet's unproven txs (fixes \"Maximum BEEF depth exceeded\"); nothing is broadcast")
@@ -438,16 +454,28 @@ program
       print(r, () => [r.sync ? describeSync(r.sync) : 'proof sync: not available for this wallet', r.repair ? describeRepair(r.repair) : ''].filter(Boolean).join('\n'));
     }),
   );
-program.command('stop').description('kill switch: refuse every spending action').action(run(stopAll(true)));
-program.command('resume').description('turn the kill switch off').action(run(stopAll(false)));
+program
+  .command('stop')
+  .description('kill switch: refuse every spending action (no PIN needed)')
+  .action(
+    run(() => {
+      og.stopAllAgents('stop');
+      console.log('All agents stopped. Every spending action is refused until the owner runs `bwalletx resume`.');
+    }),
+  );
+program
+  .command('resume')
+  .description('turn the kill switch off (owner PIN, in your own terminal)')
+  .action(run(async () => console.log((await og.resumeAll()) + (allStopped() ? ' (still stopped: see `bwalletx owner status`)' : ''))));
 
 program
   .command('mcp')
   .description('run as a stdio MCP server')
+  .option('--mint-dir <dir>', 'the only folder MCP `mint` may read files from (default ~/.bwalletx/mint-inbox)')
   .action(
-    run(async () => {
+    run(async (o: { mintDir?: string }) => {
       const { runMcp } = await import('./mcp.js');
-      await runMcp(VERSION);
+      await runMcp(VERSION, { mintDir: o.mintDir });
     }),
   );
 
@@ -473,6 +501,7 @@ brc
   .option('-a, --account <name>', 'agent account')
   .action(
     run(async (o: { account?: string }) => {
+      await og.requireOwner('move the old CLI wallet into the shared wallet');
       const { name, keys, b, w: shared } = await brc100Account(o.account, true);
       const local = await b.openWallet(name, keys);
       try {
@@ -561,7 +590,7 @@ program
   .command('stamp <file>')
   .description("put the file's SHA-256 on chain (one OP_RETURN, bwx.stamp/1) from an agent key-file account; prints the txid. Only the hash goes on chain")
   .option('-a, --account <name>', 'agent account (key file; paired accounts are refused)')
-  .option('--register <path>', 'append a row to this SEAL-REGISTER.md (created if missing)')
+  .option('--register <path>', 'append a row to this Markdown register (created if missing)')
   .action(
     run(async (file: string, o: { account?: string; register?: string }) => {
       const { stampFile } = await import('./stamp.js');
@@ -601,10 +630,9 @@ program
   .option('-p, --port <n>', 'port', '3321')
   .option('--max-usd <n>', 'most one payment from a site may move, in USD', '1')
   .option('--budget-usd <n>', 'most this serve session may move in total, in USD', '5')
-  .option('--allow-any-origin', "allow --origin '*' (any web page on this machine)")
   .option('--allow-token-transfers', 'let sites move BSV-21 tokens / ordinals (the USD caps cannot value them)')
   .action(
-    run(async (o: { account?: string; origin?: string[]; listPairings?: boolean; revoke?: string; port: string; shared?: boolean; wallet?: string; maxUsd: string; budgetUsd: string; allowAnyOrigin?: boolean; allowTokenTransfers?: boolean }) => {
+    run(async (o: { account?: string; origin?: string[]; listPairings?: boolean; revoke?: string; port: string; shared?: boolean; wallet?: string; maxUsd: string; budgetUsd: string; allowTokenTransfers?: boolean }) => {
       const sp = await import('./servePairing.js');
       if (o.listPairings) {
         const all = sp.listPairings();
@@ -619,6 +647,7 @@ program
       }
       if (!o.origin?.length) throw new Error('serve needs --origin <host...> (or --list-pairings / --revoke <origin>)');
       const origins = o.origin;
+      await og.requireOwner(`serve this wallet to ${origins.join(', ')}`);
       const confirmPairing = async ({ origin, code }: { origin: string; code: string }) => {
         if (!process.stdin.isTTY) {
           console.log(`Pairing request from ${origin} refused: serve has no terminal to ask in.`);
@@ -635,7 +664,7 @@ program
           rl.close();
         }
       };
-      const limits = { maxUsdPerAction: Number(o.maxUsd), sessionBudgetUsd: Number(o.budgetUsd), allowAnyOrigin: !!o.allowAnyOrigin, allowTokenTransfers: !!o.allowTokenTransfers, confirmPairing };
+      const limits = { maxUsdPerAction: Number(o.maxUsd), sessionBudgetUsd: Number(o.budgetUsd), allowTokenTransfers: !!o.allowTokenTransfers, confirmPairing };
       if (!(limits.maxUsdPerAction >= 0) || !(limits.sessionBudgetUsd >= 0)) throw new Error('--max-usd and --budget-usd must be numbers >= 0');
       const kind = o.wallet ?? (o.shared ? 'shared' : 'local');
       if (!['local', 'shared', 'paired'].includes(kind)) throw new Error(`--wallet must be local, shared or paired (got "${kind}")`);

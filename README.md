@@ -10,6 +10,7 @@ Only agent accounts can be exported, never the main wallet. The agent account's 
 
 ```sh
 npm i -g bwalletx      # Node 20+
+bwalletx owner setup   # once, in your own terminal: set the owner PIN (see "Owner PIN" below)
 ```
 
 ## Pair with your phone (recommended)
@@ -69,24 +70,25 @@ AES-256-GCM, tag appended to the ciphertext exactly as WebCrypto returns it. `sr
 ```bash
 bwalletx balance --account trader                 # BSV + BSV-21 tokens, valued in USD
 bwalletx price <tokenId>                          # floor price, USD per token
-bwalletx send 5 richard@bwalletx.com --account trader   # $5 of BSV to a paymail or address
+bwalletx send 5 alice@bwalletx.com --account trader     # $5 of BSV to a paymail or address
 bwalletx buy <tokenId> --max-usd 2 --account trader
 bwalletx list <outpoint> --price 50000 -a trader  # list an ordinal / OpNS name / BSV-21 output on the 1Sat order book
 bwalletx unlist <outpoint> -a trader              # cancel it; the item comes back to the wallet
 bwalletx listings -a trader                       # your open listings, price and live status
 bwalletx buy-listing <outpoint> -a trader         # buy one listing (ordinal or BSV-21) by outpoint
 bwalletx strategy load ./accumulator.json --account trader          # paper ($100 pretend book)
-bwalletx strategy load ./accumulator.json --account trader --live   # real money
+bwalletx strategy load ./accumulator.json --account trader --live   # real money (owner PIN)
 bwalletx strategy show | unload
 bwalletx agent run trader --interval 300          # rule-driven loop; Ctrl-C to stop
 bwalletx log --account trader                     # ~/.bwalletx/log/trader.jsonl
-bwalletx stop                                     # kill switch: refuse all spending
-bwalletx resume
-bwalletx cap trader 10                            # optional $10/day cap ("off" to clear)
+bwalletx stop                                     # kill switch: refuse all spending (no PIN)
+bwalletx resume                                   # owner PIN
+bwalletx cap trader 5                             # lower the daily cap (no PIN); raising or "off" needs the owner PIN
+bwalletx owner status                             # PIN set? settings verified? the limits the gate enforces
 bwalletx mcp                                      # stdio MCP server
-bwalletx stamp ./SH01-receipt.pdf -a bcorp --register ./treasury/SEAL-REGISTER.md   # file's SHA-256 on chain, prints the txid
-bwalletx verify ./SH01-receipt.pdf <txid>         # does that tx carry this file's SHA-256? (exit 1 if not)
-bwalletx paymail register bstamp -a bstamp       # claim bstamp@bwalletx.com for an agent account (signed by its key)
+bwalletx stamp ./receipt.pdf -a records --register ./REGISTER.md   # file's SHA-256 on chain, prints the txid
+bwalletx verify ./receipt.pdf <txid>              # does that tx carry this file's SHA-256? (exit 1 if not)
+bwalletx paymail register myagent -a trader       # claim myagent@bwalletx.com for an agent account (signed by its key)
 ```
 
 ### Stamps (`stamp` / `verify`)
@@ -111,7 +113,7 @@ launchpads, games, anything that asks for `createAction`, `signAction`, `createS
 
 ```bash
 bwalletx brc100 fund      -a trader                      # move the pay address's BSV into the BRC-100 wallet
-bwalletx serve            -a trader --origin www.tokenblaster.lol localhost:3000
+bwalletx serve            -a trader --origin www.example.com localhost:3000   # owner PIN
 bwalletx brc100 balance   -a trader
 bwalletx brc100 withdraw all 1YourAddress… -a trader     # take it back out
 ```
@@ -125,7 +127,9 @@ and only backs up every 5 minutes, so the two would drift. `brc100 migrate` move
 `serve` listens on `http://localhost:3321`, where BRC-100 sites already look for a desktop wallet, so they
 find it the same way they find BSV Desktop. Built on `@bsv/wallet-toolbox`; keys are decrypted into memory only.
 
-- **Allowlist**: only the hosts given with `--origin` get an answer; everyone else gets 403.
+- **Allowlist**: only the hosts given with `--origin` get an answer; everyone else gets 403. Wildcards (`*`,
+  `*.example.com`) are refused: there is no way to let every page on the machine use the wallet.
+- **Owner PIN**: starting `serve` needs the owner PIN at a terminal, like every other loosening.
 - **Pairing**: the Origin header proves nothing (any program on the machine can send one), so each allowed
   site pairs once. The site sends `POST /pair`; serve prints the origin and an 8-digit comparison code in its
   terminal and asks `y/N`. The response streams `{"code":"1234 5678"` at once (the site shows it so the owner can
@@ -150,21 +154,71 @@ find it the same way they find BSV Desktop. Built on `@bsv/wallet-toolbox`; keys
 
 ## Default limits
 
-- New accounts (import or pairing) start with a **$10/day cap**. Change it with `bwalletx cap <account> <usd>`,
-  or `off` to clear it. Existing accounts keep their setting.
-- MCP `send` and `brc100_withdraw` move at most **$5 per call** (`BWALLETX_MCP_MAX_USD` in the MCP server env
-  changes it). `brc100_withdraw` with `usd: "all"` also needs `confirmAll: true`, and the per-call limit
-  still applies.
+- New accounts (import or pairing) start with a **$10/day cap**. Lower it with `bwalletx cap <account> <usd>`;
+  raising it or `off` needs the owner PIN.
+- MCP `send`, `buy`, `buy_listing`, `buy_product` and `brc100_withdraw` move at most **$5 per call**
+  (`BWALLETX_MCP_MAX_USD` in the MCP server env changes it). `brc100_withdraw` with `usd: "all"` also needs
+  `confirmAll: true`, and the per-call limit still applies. `buy_listing` without `maxUsd` uses the limit.
+- Until an owner PIN is set, every account is clamped to **$10/day, 30 spending actions/hour, strategies on paper**,
+  whatever config.json says.
+
+## Owner PIN
+
+Raising or clearing a cap, a rate limit or the approval threshold, `resume`, `strategy load --live`, `key import` /
+`key new`, `login` / `pair`, `brc100 migrate` and starting `serve` all **loosen** safety settings. Since 0.6.0
+each of them needs:
+
+1. a person at an **interactive terminal** (stdin and stdout are a TTY; piped input is refused and `BWALLETX_YES`
+   is ignored for these),
+2. **not** the MCP server (`bwalletx mcp` marks itself, and its child processes, and refuses them), and
+3. the **owner PIN**, typed at a hidden prompt. It is separate from the wallet passphrase (bwalletx refuses a PIN
+   that opens one of your key files or equals `BWALLETX_PASSPHRASE`) and is never read from an environment
+   variable or an argument. Only a slow scrypt hash of it is stored (`~/.bwalletx/owner.json`).
+
+**Tightening needs no PIN, from anywhere**, including MCP: `stop`, lowering a cap, a rate limit or the approval
+threshold (`lower_cap` over MCP).
+
+The limits themselves are **signed**: `~/.bwalletx/owner-settings.json` holds the caps, rate limits, approval
+thresholds, stop flags and which live strategy file you approved, signed with a key derived from your PIN. The
+gate checks the signature on every spend (no PIN needed for that) and enforces the **tighter** of the signed value
+and config.json. So:
+
+- editing config.json, or a strategy file, by hand cannot loosen anything (an edited live strategy is refused);
+- if owner-settings.json is edited, deleted or can't be verified, every account is treated as **stopped**, with
+  default caps, until you run `bwalletx resume` (PIN), which then signs the safe defaults; review them with
+  `bwalletx owner status` and approve config.json with `bwalletx owner sign`;
+- `stop` removes the signature, so deleting the STOP file does not resume anything.
+
+Commands: `bwalletx owner setup` (once), `owner change` (old PIN, then new), `owner sign` (review and sign
+config.json), `owner status` (no PIN).
+
+**Upgrading from 0.5.x**: nothing is lost, but until you set a PIN the defaults above apply ($10/day, 30/hour,
+live strategies refused). In your own terminal run `bwalletx owner setup`, choose a PIN, check the settings it
+lists and answer `y` to keep them (live strategies included), or `N` for the safe defaults.
+
+**What this does not do.** It stops an agent that runs `bwalletx cap <acct> off` or edits the JSON files. It can't
+stop an agent that has a shell **and** knows your PIN **and** fakes a terminal; or one that deletes all the owner
+files (that only gets it back to the defaults above, and `owner status` then shows no PIN); or one that copies an
+older signed settings file back (never looser than something you signed). A key-file account's keys are only as
+safe as `BWALLETX_PASSPHRASE`, which sits in your MCP client's config: an agent that can read that file can take
+the key itself and skip bwalletx entirely. So for real money:
+
+- use a **paired** account (keys on the phone) and set **approve-above**: bigger spends are approved on the phone,
+  and no bwalletx code path, the owner PIN included, can approve a spend;
+- keep key-file accounts small (the balance is the budget);
+- don't give an AI agent a shell on the machine that holds a key-file account with real money.
 
 ## The gate
 
 Every spending action, from the CLI, `agent run` or MCP, passes the same checks in this order:
 
-1. **Kill switch** (`bwalletx stop`, file `~/.bwalletx/STOP`) or the account is stopped
-2. **Daily cap** for the account (if set)
-3. **Rate limit**: at most 30 spending actions per hour per account (paper and failed attempts count)
-4. **Strategy rules** (`bwalletx.strategy/1`; same `parseStrategy` / `checkRules` / `paperFill` as the app)
-5. **Paper mode** fills on the paper book and never signs
+1. **Kill switch** (`bwalletx stop`, file `~/.bwalletx/STOP`, or owner settings that don't verify) or the account is stopped
+2. **Daily cap** for the account (the tighter of the signed and configured value)
+3. **Live strategy approved**: a live strategy file must be the one signed with the owner PIN
+4. **Approve-above**: single spends over the threshold are refused until the owner approves them
+5. **Rate limit**: at most 30 spending actions per hour per account (paper and failed attempts count)
+6. **Strategy rules** (`bwalletx.strategy/1`; same `parseStrategy` / `checkRules` / `paperFill` as the app)
+7. **Paper mode** fills on the paper book and never signs
 
 Every refusal is logged with the rule that refused it.
 
@@ -280,18 +334,22 @@ accounts need `BWALLETX_PASSPHRASE` in the MCP env, paired accounts sign on the 
 | `strategy_load` | load a strategy file, always in **paper** mode |
 | `log` | recent activity log entries |
 | `stop_all` | kill switch: refuse every spending action |
+| `lower_cap` | lower an account's daily cap (lowering only) |
 | `brc100_balance` | BRC-100 wallet balance (`wallet`: `local` or `shared`) |
 | `brc100_addresses` | pay address + app receive addresses (key-file accounts only) |
 | `brc100_fund` | move the account's own pay/receive BSV into its own BRC-100 wallet (no money leaves; logged; refused while stopped) |
 | `brc100_withdraw` | send `usd` (or `"all"`) from the BRC-100 wallet to an address (gated like `send`; paper refuses; logged; ARC relay) |
-| `mint`, `mint_manifest` | mint files / a manifest as NFTs on a paired phone (the phone signs within its pairing's mint limits; refused while stopped; `dryRun` estimates only) |
+| `mint`, `mint_manifest` | mint files / a manifest as NFTs on a paired phone (the phone signs within its pairing's mint limits; refused while stopped; `dryRun` estimates only). Only files inside the **mint folder** (`~/.bwalletx/mint-inbox`, or `bwalletx mcp --mint-dir <dir>`); paths are relative to it; anything outside it after following symlinks, dotfiles and hidden folders are refused; over 1 MB needs a `dryRun` of the same files first or `confirm: true` |
 | `pairing_status` | whether an account is paired and how (agent or brc100 main wallet), scopes, expiry, limits; never secrets |
 | `serve_status` | whether something listens on the `serve` port (3321) |
 
-**Human-only, never exposed over MCP:** `cap` changes, `resume`, `strategy load --live`, `key import`,
-`pair` / `login` / `logout`, `brc100 migrate`, and starting/stopping `serve`. They loosen safety settings, change
-trust or key material, or need a person at the terminal or phone. An agent can stop things (`stop_all`) but
-never turn them back on or raise its own limits.
+**Human-only, never exposed over MCP:** raising caps or limits, `resume`, `strategy load --live`, `key import`,
+`pair` / `login` / `logout`, `brc100 migrate`, and starting/stopping `serve`. Being off MCP is not the only guard:
+the commands themselves need the owner PIN at a terminal (see "Owner PIN"), so an agent with a shell can't just run
+them either. An agent can stop things (`stop_all`, `lower_cap`) but never turn them back on or raise its own limits.
+
+`mint` publishes files on chain for anyone to read, so over MCP it only reads the mint folder. Put the files you
+want minted there yourself.
 
 **Claude Code**
 
@@ -315,6 +373,11 @@ claude mcp add bwalletx -e BWALLETX_PASSPHRASE=your-passphrase-here -- bwalletx 
 
 Leave out `BWALLETX_PASSPHRASE` to keep MCP read-only and paper-only: live sends then fail with
 "No passphrase". If `bwalletx` isn't on the PATH, use `"command": "node", "args": ["/path/to/bwalletx-cli/dist/cli.js", "mcp"]`.
+
+## Security
+
+Please report security problems privately through GitHub's security advisories for this repository
+(Security › Report a vulnerability), not in public issues.
 
 ## Development
 

@@ -44,7 +44,7 @@ const pair = () => {
   return { parent, child, inputBEEF };
 };
 
-/** The bstamp state of 2 Nov 2026: import unsent, two stamps failed, their inputs left unspendable. */
+/** The state of a stamping account on 2 Nov 2026: import unsent, two stamps failed, their inputs left unspendable. */
 const seed = async () => {
   const { child, inputBEEF } = pair();
   const txid = child.id('hex');
@@ -70,7 +70,7 @@ describe('bwalletx repair', () => {
 
   test('spends refuse while a parent is unsent', async () => {
     await seed();
-    await expect(assertNothingUnsent(db, 'bstamp')).rejects.toThrow(/bwalletx repair -a bstamp/);
+    await expect(assertNothingUnsent(db, 'stamps')).rejects.toThrow(/bwalletx repair -a stamps/);
   });
 
   test('re-broadcasts the unsent import, then frees the input a failed stamp locked (once the chain says unspent)', async () => {
@@ -88,7 +88,7 @@ describe('bwalletx repair', () => {
     expect((await db('transactions').where({ transactionId: 1 }).first()).status).toBe('unproven');
     // The failed stamp's own change is never freed.
     expect(Boolean((await db('outputs').where({ satoshis: 4975 }).first()).spendable)).toBe(false);
-    await expect(assertNothingUnsent(db, 'bstamp')).resolves.toBeUndefined();
+    await expect(assertNothingUnsent(db, 'stamps')).resolves.toBeUndefined();
   });
 
   test('a "failed" stamp that landed after all: inputs marked spent by it, its change spendable again', async () => {
