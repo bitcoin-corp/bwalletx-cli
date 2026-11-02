@@ -519,6 +519,38 @@ brc
   );
 
 program
+  .command('stamp <file>')
+  .description("put the file's SHA-256 on chain (one OP_RETURN, bwx.stamp/1) from an agent key-file account; prints the txid. Only the hash goes on chain")
+  .option('-a, --account <name>', 'agent account (key file; paired accounts are refused)')
+  .option('--register <path>', 'append a row to this SEAL-REGISTER.md (created if missing)')
+  .action(
+    run(async (file: string, o: { account?: string; register?: string }) => {
+      const { stampFile } = await import('./stamp.js');
+      const r = await stampFile(file, o);
+      print(r, () => `Stamped ${r.file}
+  sha256 ${r.sha256}
+  txid   ${r.txid}
+  account ${r.account} at ${r.timestamp}`);
+    }),
+  );
+
+program
+  .command('verify <file> <txid>')
+  .description("recheck a file against a stamp on chain: does that transaction carry this file's SHA-256?")
+  .action(
+    run(async (file: string, txid: string) => {
+      const { verifyStamp } = await import('./stamp.js');
+      const r = await verifyStamp(file, txid);
+      print(r, () =>
+        r.match
+          ? `Match: ${r.file} (${r.sha256}) is stamped in ${r.txid}${r.blockTime ? `, mined ${r.blockTime}` : ', not mined yet'} (${r.confirmations} confirmations)`
+          : `NO MATCH: ${r.txid} ${r.stamped ? `stamps ${r.stamped}` : 'carries no bwx.stamp/1 output'}, the file hashes to ${r.sha256}`,
+      );
+      if (!r.match) process.exitCode = 1;
+    }),
+  );
+
+program
   .command('serve')
   .description('serve the agent account as a BRC-100 wallet on http://localhost:3321 for the sites you allow')
   .option('-a, --account <name>', 'agent account')
