@@ -84,7 +84,19 @@ bwalletx stop                                     # kill switch: refuse all spen
 bwalletx resume
 bwalletx cap trader 10                            # optional $10/day cap ("off" to clear)
 bwalletx mcp                                      # stdio MCP server
+bwalletx stamp ./SH01-receipt.pdf -a bcorp --register ./treasury/SEAL-REGISTER.md   # file's SHA-256 on chain, prints the txid
+bwalletx verify ./SH01-receipt.pdf <txid>         # does that tx carry this file's SHA-256? (exit 1 if not)
 ```
+
+### Stamps (`stamp` / `verify`)
+
+`stamp` puts only the file's SHA-256 on chain, never the file or its name, in one 0-sat output:
+`OP_FALSE OP_RETURN "bwx.stamp/1" <32-byte sha256>`. It runs from an **agent key-file account**, so there's no phone tap.
+Fund it first with `bwalletx brc100 fund`. It goes through the same gate as every spend: kill switch, daily cap,
+rate limit, strategy rules. A strategy that allow-lists `sendTo` must include `"stamp"`. Paired accounts are refused,
+because their keys stay on the phone. `--register` appends `| time | file | sha256 | txid | account |` to a Markdown
+register, creating it if missing. `--json` prints `{ file, sha256, txid, account, timestamp }`. `verify` rechecks a
+file against the transaction on WhatsOnChain and reports confirmations and block time.
 
 Add `--json` for machine-readable output. `send` asks for confirmation on a terminal; `-y` skips it.
 
