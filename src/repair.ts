@@ -26,6 +26,16 @@ type Req = { provenTxReqId: number; txid: string; status: string; rawTx: Uint8Ar
 
 export type Post = (rawTxHex: string) => Promise<{ ok: boolean; status: number; txStatus?: string; detail?: string }>;
 export type IsUnspent = (txid: string, vout: number) => Promise<boolean | undefined>;
+/** A tx as the chain has it (its inputs), or null when the chain doesn't know it. */
+export type GetTx = (txid: string) => Promise<{ vin: { txid: string; vout: number }[] } | null>;
+
+export const wocGetTx: GetTx = async (txid) => {
+  const r = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/hash/${txid}`, { signal: AbortSignal.timeout(15_000) });
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(`WhatsOnChain ${r.status}`);
+  const j = (await r.json()) as { vin?: { txid: string; vout: number }[] };
+  return { vin: (j.vin ?? []).map((v) => ({ txid: v.txid, vout: v.vout })) };
+};
 
 /** POST one tx to ARC; ok when ARC took it (or already has it). */
 export const postToArc: Post = async (rawTx) => {
@@ -81,14 +91,17 @@ export async function assertNothingUnsent(db: Db | undefined, account: string) {
 
 export type RepairReport = {
   rebroadcast: { txid: string; ok: boolean; detail?: string }[];
+  /** Actions storage marks failed that are on chain after all (ARC held them until their parent arrived). */
+  landed: { txid: string }[];
   freed: { outpoint: string; satoshis: number }[];
   skipped: { outpoint: string; reason: string }[];
 };
 
-export async function repairWallet(db: Db, o: { post?: Post; isUnspent?: IsUnspent } = {}): Promise<RepairReport> {
+export async function repairWallet(db: Db, o: { post?: Post; isUnspent?: IsUnspent; getTx?: GetTx } = {}): Promise<RepairReport> {
   const post = o.post ?? postToArc;
   const isUnspent = o.isUnspent ?? wocIsUnspent;
-  const report: RepairReport = { rebroadcast: [], freed: [], skipped: [] };
+  const getTx = o.getTx ?? wocGetTx;
+  const report: RepairReport = { rebroadcast: [], landed: [], freed: [], skipped: [] };
 
   for (const req of await unsentReqs(db)) {
     let res: Awaited<ReturnType<Post>>;
@@ -101,6 +114,30 @@ export async function repairWallet(db: Db, o: { post?: Post; isUnspent?: IsUnspe
     if (!res.ok) continue;
     await db('proven_tx_reqs').where({ provenTxReqId: req.provenTxReqId }).update({ status: 'unmined' });
     await db('transactions').where({ txid: req.txid }).whereIn('status', ['sending', 'unprocessed']).update({ status: 'unproven' });
+  }
+
+  // "Failed" actions that landed anyway (2 Nov 2026: both bstamp stamps reached the mempool once their parent did): mark
+  // them unproven, their inputs spent by them, and their own outputs spendable where the chain says unspent.
+  const failed: { transactionId: number; txid: string | null }[] = await db('transactions').where({ status: 'failed' });
+  for (const t of failed) {
+    if (!t.txid) continue;
+    const onChain = await getTx(t.txid).catch(() => null);
+    if (!onChain) continue;
+    await db('transactions').where({ transactionId: t.transactionId }).update({ status: 'unproven' });
+    await db('proven_tx_reqs').where({ txid: t.txid }).update({ status: 'unmined' });
+    for (const v of onChain.vin)
+      await db('outputs').where({ txid: v.txid, vout: v.vout }).update({ spendable: false, spentBy: t.transactionId });
+    const own: { outputId: number; vout: number; satoshis: number }[] = await db('outputs')
+      .where({ transactionId: t.transactionId })
+      .where('satoshis', '>', 0);
+    for (const out of own) {
+      const unspent = await isUnspent(t.txid, out.vout);
+      if (unspent === true) {
+        await db('outputs').where({ outputId: out.outputId }).update({ spendable: true });
+        report.freed.push({ outpoint: `${t.txid}.${out.vout}`, satoshis: Number(out.satoshis) });
+      }
+    }
+    report.landed.push({ txid: t.txid });
   }
 
   // Outputs a failed action locked: unspendable, spent by nothing in storage, from a tx that isn't failed itself.

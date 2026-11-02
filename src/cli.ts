@@ -528,6 +528,7 @@ program
       print(r, () =>
         [
           `${r.account}: re-sent ${r.rebroadcast.filter((x) => x.ok).length} of ${r.rebroadcast.length} unsent transactions`,
+          ...(r.landed.length ? [`${r.landed.length} actions marked failed were on chain after all: now tracked`, ...r.landed.map((x) => `  landed ${x.txid}`)] : []),
           ...r.rebroadcast.map((x) => `  ${x.ok ? 'ok    ' : 'FAILED'} ${x.txid} ${x.detail ?? ''}`),
           `freed ${r.freed.length} locked coins (${r.freed.reduce((n, x) => n + x.satoshis, 0)} sats)`,
           ...r.skipped.map((x) => `  skipped ${x.outpoint}: ${x.reason}`),

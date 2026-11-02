@@ -79,6 +79,7 @@ describe('bwalletx repair', () => {
     const r = await repairWallet(db, {
       post: async (hex) => (posted.push(hex), { ok: true, status: 200, txStatus: 'SEEN_ON_NETWORK' }),
       isUnspent: async (t, v) => t === txid && v === 0,
+      getTx: async () => null,
     });
     expect(posted).toHaveLength(1);
     expect(r.rebroadcast).toEqual([{ txid, ok: true, detail: 'SEEN_ON_NETWORK' }]);
@@ -90,11 +91,28 @@ describe('bwalletx repair', () => {
     await expect(assertNothingUnsent(db, 'bstamp')).resolves.toBeUndefined();
   });
 
+  test('a "failed" stamp that landed after all: inputs marked spent by it, its change spendable again', async () => {
+    const { txid } = await seed();
+    const stamp = 'b0'.repeat(32);
+    const r = await repairWallet(db, {
+      post: async () => ({ ok: true, status: 200, txStatus: 'ANNOUNCED_TO_NETWORK' }),
+      getTx: async (t) => (t === stamp ? { vin: [{ txid, vout: 0 }] } : null),
+      isUnspent: async (t, v) => (t === stamp && v === 1 ? true : t === txid && v === 0 ? false : undefined),
+    });
+    expect(r.landed).toEqual([{ txid: stamp }]);
+    expect(r.freed).toEqual([{ outpoint: `${stamp}.1`, satoshis: 4975 }]);
+    expect((await db('transactions').where({ transactionId: 2 }).first()).status).toBe('unproven');
+    const input = await db('outputs').where({ satoshis: 5089 }).first();
+    expect(Boolean(input.spendable)).toBe(false);
+    expect(input.spentBy).toBe(2);
+  });
+
   test('a refused broadcast or an output the chain can’t confirm changes nothing', async () => {
     await seed();
     const r = await repairWallet(db, {
       post: async () => ({ ok: false, status: 465, detail: 'fee too low' }),
       isUnspent: async () => undefined,
+      getTx: async () => null,
     });
     expect(r.rebroadcast[0].ok).toBe(false);
     expect(r.freed).toEqual([]);
