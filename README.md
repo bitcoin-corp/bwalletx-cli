@@ -329,7 +329,7 @@ accounts need `BWALLETX_PASSPHRASE` in the MCP env, paired accounts sign on the 
 | `buy_listing` | buy one listing by outpoint, like `buy-listing` (+1% market fee; gated as `buy`; optional `maxUsd`; `dryRun` builds only) |
 | `list_products` | bWalletX Store products agents can buy ($1 themes, $99/year Theme edition, Branded edition from $999 by quote) |
 | `quote` | signed 5-minute single-use quote: USD, sats at the live rate, MNEE amount (nothing paid) |
-| `buy_product` | quote → check → gate → pay from the BRC-100 wallet → server verifies + broadcasts → granted to this identity key (gated like `send`; `maxUsd`; `dryRun` builds only; API: `BWALLETX_STORE_API`, default https://pay.bwallet.space) |
+| `buy_product` | quote → check → gate → pay from the BRC-100 wallet → server verifies + broadcasts → granted to this identity key once the network has the payment (gated like `send`; `maxUsd`; `dryRun` builds only; API: `BWALLETX_STORE_API`, default https://pay.bwallet.space). A `202` is pending, not bought yet: see "Store answers" below |
 | `strategy_show` | the loaded strategy, mode and paper book |
 | `strategy_load` | load a strategy file, always in **paper** mode |
 | `log` | recent activity log entries |
@@ -350,6 +350,24 @@ them either. An agent can stop things (`stop_all`, `lower_cap`) but never turn t
 
 `mint` publishes files on chain for anyone to read, so over MCP it only reads the mint folder. Put the files you
 want minted there yourself.
+
+**Store answers.** The bWalletX Store marks a purchase paid only once the network has the payment
+([agent.json](https://bwalletx.com/.well-known/agent.json)):
+
+- `200`: bought. The product is granted to the account's identity key.
+- `202` with `pending: true`: the payment is pending, **not bought yet**. The Store has recorded it, but the network
+  hasn't shown it yet. Don't pay again. The same buy request (same `quote_id`, `txid` and `rawtx`) answers `200` once
+  the network has the payment, even after the quote expired.
+- `409 payment_pending`: a payment for this product (or this quote) is already on its way. Don't pay again.
+
+Until `buy_product` handles this itself, it reports a `202` as "Bought" and doesn't repeat the request. Check
+`result.pending` in its answer: `true` means pending, not bought.
+
+- **A theme:** calling `buy_product` again for the same theme is safe. While the first payment is on its way the
+  quote answers `409 payment_pending` and nothing is paid; once the network has it, the purchase completes and the
+  quote answers `already_owned`.
+- **The Theme edition or the Branded edition deposit:** don't call `buy_product` again for the same order. Once the
+  first payment has landed, a new call is a new purchase.
 
 **Claude Code**
 
