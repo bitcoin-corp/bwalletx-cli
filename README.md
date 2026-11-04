@@ -329,7 +329,7 @@ accounts need `BWALLETX_PASSPHRASE` in the MCP env, paired accounts sign on the 
 | `buy_listing` | buy one listing by outpoint, like `buy-listing` (+1% market fee; gated as `buy`; optional `maxUsd`; `dryRun` builds only) |
 | `list_products` | bWalletX Store products agents can buy ($1 themes, $99/year Theme edition, Branded edition from $999 by quote) |
 | `quote` | signed 5-minute single-use quote: USD, sats at the live rate, MNEE amount (nothing paid) |
-| `buy_product` | quote → check → gate → pay from the BRC-100 wallet → server verifies + broadcasts → granted to this identity key once the network has the payment (gated like `send`; `maxUsd`; `dryRun` builds only; API: `BWALLETX_STORE_API`, default https://pay.bwallet.space). A `202` is pending, not bought yet: see "Store answers" below |
+| `buy_product` | quote → check → gate → pay from the BRC-100 wallet: the Store records it, the wallet broadcasts it, then the claim → granted to this identity key once the network has the payment (gated like `send`; `maxUsd`; `dryRun` builds only; API: `BWALLETX_STORE_API`, default https://pay.bwallet.space). `pending: true` = not bought yet: see "Store answers" below |
 | `strategy_show` | the loaded strategy, mode and paper book |
 | `strategy_load` | load a strategy file, always in **paper** mode |
 | `log` | recent activity log entries |
@@ -360,14 +360,16 @@ want minted there yourself.
   the network has the payment, even after the quote expired.
 - `409 payment_pending`: a payment for this product (or this quote) is already on its way. Don't pay again.
 
-Until `buy_product` handles this itself, it reports a `202` as "Bought" and doesn't repeat the request. Check
-`result.pending` in its answer: `true` means pending, not bought.
+`buy_product` pays as the bWalletX app does: the Store first records the payment (an intent, nothing posted),
+then the account's own wallet broadcasts it, so its change is spendable straight away, then it claims.
 
-- **A theme:** calling `buy_product` again for the same theme is safe. While the first payment is on its way the
-  quote answers `409 payment_pending` and nothing is paid; once the network has it, the purchase completes and the
-  quote answers `already_owned`.
-- **The Theme edition or the Branded edition deposit:** don't call `buy_product` again for the same order. Once the
-  first payment has landed, a new call is a new purchase.
+- **Bought:** `ok: true` and the text starts "Bought".
+- **Pending:** `ok: true, pending: true` and the text starts "Pending, not bought yet". The tool asks again three
+  times over about 30 s first. Don't pay again: the Store grants it once the network has the payment, even after the
+  quote expires. For a theme, calling `buy_product` again is safe; it answers "already on its way" until then.
+- **409 `payment_pending`** at quote time: `ok: false, pending: true`, and nothing is built or paid.
+- The payment is released only when the Store refused the intent, so nothing was broadcast. After the broadcast it
+  is never released; a refused claim says so with the txid.
 
 **Claude Code**
 
