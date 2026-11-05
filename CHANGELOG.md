@@ -6,6 +6,15 @@ A safety release. If you let an AI agent use bwalletx, upgrade.
 
 ### What changes for you
 
+- **`buy_product` no longer calls a pending payment "Bought".** The bWalletX Store now marks a purchase paid only
+  once the network has the payment, and answers 202 until then. `buy_product` reports that as `pending: true`,
+  "Pending, not bought yet", after asking again for about 30 s. A 409 `payment_pending` at quote time means a payment
+  is already on its way, and nothing is paid.
+- **Your wallet sends Store payments itself.** As the bWalletX app now does: the Store records the payment first,
+  then your account's wallet broadcasts it (with its parent transactions), then the claim. Before, the payment stayed
+  unsent in your wallet while only the Store broadcast it, so its change could not be spent. A payment is released
+  only when nothing was broadcast.
+
 - **New: an owner PIN.** Anything that loosens a safety setting now needs you, at your own terminal, typing a
   separate owner PIN at a hidden prompt: raising or clearing a daily cap, rate limit or approval threshold,
   `resume`, `strategy load --live`, `key import` / `key new`, `login` / `pair`, `brc100 migrate` and starting
