@@ -26,6 +26,7 @@ import {
   type HelloFrame,
   type PairMessage,
 } from './pair/protocol.js';
+import { inOrder } from './pair/in-order.js';
 import { DEFAULT_DAILY_CAP_USD, home, readConfig, readJsonFile, writeConfig, writeJsonFile } from './store.js';
 
 export const CLI_ORIGIN = 'https://cli.bwalletx.com';
@@ -108,9 +109,10 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void)
       out(`Or open this link on the phone:\n${link}\n`);
     });
     ws.on('error', (err) => !sealer && (clearTimeout(timer), reject(new Error(`Pairing service unreachable: ${err.message}`))));
-    ws.on('message', async (raw) => {
+    // In order: the phone's ready can arrive while hello is still deriving the key.
+    ws.on('message', inOrder(async (raw: unknown) => {
       // A bad frame from the relay must not crash the CLI (an unhandled rejection ends the process).
-      const f = parseFrame(raw);
+      const f = parseFrame(raw as Parameters<typeof parseFrame>[0]);
       if (!f) return;
       if ((f as HelloFrame).t === 'hello' && !sealer) {
         if (!/^0[23][0-9a-f]{64}$/i.test(String((f as HelloFrame).k))) return;
@@ -168,7 +170,7 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void)
         ws.close();
         reject(new Error('Cancelled on the phone.'));
       }
-    });
+    }));
   });
 }
 
@@ -219,7 +221,7 @@ export class PhoneSession {
       this.ws.once('open', () => resolve());
       this.ws.once('error', (e) => reject(new Error(`Pairing service unreachable: ${e.message}`)));
     });
-    this.ws.on('message', (raw) => void this.onFrame(String(raw)));
+    this.ws.on('message', inOrder((raw: unknown) => this.onFrame(String(raw))));
     this.ws.on('close', () => ((this.closed = true), this.failAll(new Error('Connection to the pairing service closed.'))));
   }
 
