@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bNamesX Miner</title>
+<style>
+  :root { --bg:#000; --fg:#fff; --mute:#9a9a9a; --gold:#d4af37; --line:#262626; --bad:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system, "Segoe UI", Inter, system-ui, sans-serif; }
+  main { max-width: 920px; margin: 0 auto; padding: 24px 16px 64px; }
+  header { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; border-bottom:1px solid var(--line); padding-bottom:16px; }
+  h1 { font-size: 22px; margin:0; letter-spacing:.02em; } h1 b { color: var(--gold); }
+  .pill { border:1px solid var(--line); border-radius:999px; padding:4px 12px; font-size:13px; color:var(--mute); }
+  .pill.on { color: var(--gold); border-color: var(--gold); }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap:12px; margin:20px 0; }
+  .card { border:1px solid var(--line); border-radius:12px; padding:14px 16px; min-width:0; }
+  .k { color:var(--mute); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+  .v { font-size:24px; font-weight:600; margin-top:4px; word-break:break-word; }
+  .s { color:var(--mute); font-size:13px; }
+  .bar { height:6px; background:var(--line); border-radius:3px; margin-top:8px; overflow:hidden; } .bar i { display:block; height:100%; background:var(--gold); width:0; }
+  button { background:transparent; color:var(--fg); border:1px solid var(--fg); border-radius:8px; padding:9px 16px; font:inherit; cursor:pointer; }
+  button.gold { background:var(--gold); border-color:var(--gold); color:#000; font-weight:600; }
+  button:disabled { opacity:.35; cursor:default; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  section { border:1px solid var(--line); border-radius:12px; padding:16px; margin-top:12px; }
+  h2 { font-size:14px; margin:0 0 10px; color:var(--gold); text-transform:uppercase; letter-spacing:.08em; }
+  code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size:13px; word-break:break-all; }
+  input[type=number] { background:#000; color:#fff; border:1px solid var(--line); border-radius:8px; padding:8px 10px; width:110px; font:inherit; }
+  label { display:inline-flex; gap:6px; align-items:center; margin-right:16px; }
+  .qr { background:#fff; padding:8px; border-radius:8px; width:170px; height:170px; }
+  .qr img { width:100%; height:100%; }
+  ul { list-style:none; padding:0; margin:0; columns: 3 140px; } li { padding:2px 0; } li span { color:var(--mute); font-size:12px; }
+  .err { color: var(--bad); white-space: pre-wrap; }
+  .dry { background: var(--gold); color:#000; text-align:center; padding:6px; font-weight:600; }
+</style>
+</head>
+<body>
+<div id="dry" class="dry" hidden>DRY RUN: simulated chain, nothing is signed or broadcast</div>
+<main>
+  <header>
+    <h1><b>b</b>NamesX Miner</h1>
+    <div class="row"><span id="phase" class="pill">…</span><span id="who" class="pill">bWalletX not connected</span><button id="connect" class="gold">Connect bWalletX</button></div>
+  </header>
+
+  <div class="grid">
+    <div class="card"><div class="k">Names mined</div><div class="v" id="done">0</div><div class="s" id="left"></div></div>
+    <div class="card"><div class="k">Spent of 1 BSV cap</div><div class="v" id="spent">$0.00</div><div class="s" id="spentSats"></div><div class="bar"><i id="spentBar"></i></div></div>
+    <div class="card"><div class="k">Rate</div><div class="v" id="rate">–</div><div class="s" id="eta"></div></div>
+    <div class="card"><div class="k">Now</div><div class="v" id="cur">–</div><div class="s" id="detail"></div></div>
+  </div>
+
+  <div class="row">
+    <button id="start" class="gold">Start</button>
+    <button id="pause">Pause</button>
+    <button id="topup">Top up</button>
+    <button id="stop">Stop and quit</button>
+  </div>
+  <p class="err" id="err"></p>
+
+  <section id="fund">
+    <h2>Fund the miner</h2>
+    <p class="s">The miner pays its own small network fees from a hot key made on this PC (it never leaves this PC). Send it a little BSV once; it starts by itself when the coins arrive. Funded so far: <b id="funded">$0.00</b>, room left under the cap: <b id="room"></b>.</p>
+    <div class="row">
+      <label>$ <input id="usd" type="number" min="1" step="1" value="10"></label>
+      <button id="pay" class="gold">Pay with bWalletX</button>
+      <span class="s" id="payMsg"></span>
+    </div>
+    <div class="row" style="margin-top:14px; align-items:flex-start">
+      <div class="qr"><img id="qr" alt="QR code of the miner's address"></div>
+      <div style="min-width:0; flex:1"><div class="k">No extension? Send BSV to</div><code id="payAddr"></code><div class="s" id="waiting"></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Where things go</h2>
+    <p class="s">Names: <label><input type="radio" name="names" value="vault"> Vault <code id="vaultTo"></code></label><label><input type="radio" name="names" value="wallet"> Connected bWalletX</label></p>
+    <p class="s">Payments: <label><input type="radio" name="pay" value="vault"> Vault <code id="vaultPay"></code></label><label><input type="radio" name="pay" value="wallet"> Connected bWalletX</label></p>
+    <p class="s">Now: names to <code id="toNow"></code>, payments to <code id="payNow"></code>. Changes apply from the next Start. This PC mines <b id="range"></b>.</p>
+  </section>
+
+  <section>
+    <h2>Recent names</h2>
+    <ul id="recent"><li class="s">None yet.</li></ul>
+  </section>
+</main>
+<script src="/connect.js?t=__TOKEN__"></script>
+<script>
+const T = '__TOKEN__';
+const $ = (id) => document.getElementById(id);
+const api = async (path, body) => {
+  const r = await fetch(path, { method: body ? 'POST' : 'GET', headers: { 'x-token': T, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+};
+let st = null, wallet = null, identityKey = null;
+const usd = (sats) => st && st.usdPerBsv ? '$' + ((sats / 1e8) * st.usdPerBsv).toFixed(2) : (sats / 1e8).toFixed(8) + ' BSV';
+const n = (x) => Number(x || 0).toLocaleString('en-US');
+const showErr = (e) => ($('err').textContent = e ? (e.message || String(e)) : '');
+
+async function refresh() {
+  try { st = await api('/api/status'); } catch (e) { return showErr(e); }
+  $('dry').hidden = !st.dry;
+  $('phase').textContent = st.phase; $('phase').classList.toggle('on', st.phase === 'running');
+  const s = st.summary || { done: 0, pending: 0, total: 0, spentSats: 0, skipped: 0, etaSeconds: null };
+  $('done').textContent = n(s.done);
+  $('left').textContent = n(s.pending) + ' to go of ' + n(s.total) + (s.skipped ? ', ' + n(s.skipped) + ' taken' : '');
+  $('spent').textContent = usd(s.spentSats);
+  $('spentSats').textContent = n(s.spentSats) + ' of ' + n(st.capSats) + ' sats';
+  $('spentBar').style.width = Math.min(100, (100 * s.spentSats) / st.capSats) + '%';
+  $('rate').textContent = st.rateHs ? (st.rateHs / 1e6).toFixed(1) + ' MH/s' : '–';
+  $('eta').textContent = s.etaSeconds ? 'about ' + (s.etaSeconds / 3600).toFixed(1) + ' h left' : '';
+  $('cur').textContent = st.current || '–'; $('detail').textContent = st.detail || '';
+  $('funded').textContent = usd(st.fundedSats); $('room').textContent = usd(st.fundRoom);
+  $('payAddr').textContent = st.payAddress;
+  $('waiting').textContent = st.payBalance ? usd(st.payBalance) + ' (' + n(st.payBalance) + ' sats) arrived, moving into the miner on the next Start' : '';
+  $('vaultTo').textContent = st.vaultTo; $('vaultPay').textContent = st.vaultPay; $('range').textContent = st.range;
+  $('toNow').textContent = st.to; $('payNow').textContent = st.payTo;
+  for (const el of document.querySelectorAll('input[name=names]')) el.checked = el.value === st.dest.names;
+  for (const el of document.querySelectorAll('input[name=pay]')) el.checked = el.value === st.dest.pay;
+  $('start').disabled = st.phase === 'running' || st.phase === 'pausing';
+  $('pause').disabled = st.phase !== 'running';
+  $('err').textContent = st.error || '';
+  $('recent').innerHTML = st.recent.length ? st.recent.map((r) => '<li>' + r.name + ' <span>' + new Date(r.at).toLocaleTimeString() + '</span></li>').join('') : '<li class="s">None yet.</li>';
+}
+
+async function connect() {
+  showErr();
+  const C = window.bWalletXConnect;
+  wallet = C ? await C.findBwalletX(2000).catch(() => null) : null;
+  if (!wallet && window.CWI) wallet = window.CWI;
+  if (!wallet) { $('who').textContent = 'No bWalletX extension found: use the QR code'; return null; }
+  const r = await wallet.getPublicKey({ identityKey: true });
+  identityKey = r.publicKey;
+  $('who').textContent = 'Connected ' + identityKey.slice(0, 8) + '…' + identityKey.slice(-6); $('who').classList.add('on');
+  $('connect').textContent = 'Connected';
+  await api('/api/dest', { names: st.dest.names, pay: st.dest.pay, identityKey }).catch(() => null);
+  return wallet;
+}
+
+async function fund() {
+  showErr(); $('payMsg').textContent = '';
+  try {
+    const q = await api('/api/fund-quote', { usd: Number($('usd').value) });
+    if (!wallet && !(await connect())) { $('payMsg').textContent = 'Scan the QR code instead.'; return; }
+    $('payMsg').textContent = 'Approve ' + '$' + q.usd + ' (' + n(q.sats) + ' sats) in bWalletX…';
+    const r = await window.bWalletXConnect.pay(wallet, { to: q.to, sats: q.sats, memo: 'bNamesX miner top-up' });
+    await api('/api/funded', { sats: q.sats, txid: r.txid });
+    $('payMsg').textContent = 'Sent. txid ' + r.txid.slice(0, 12) + '… The miner starts when it arrives.';
+    refresh();
+  } catch (e) { showErr(e); $('payMsg').textContent = ''; }
+}
+
+$('connect').onclick = () => connect().catch(showErr);
+$('pay').onclick = fund;
+$('topup').onclick = () => { $('fund').scrollIntoView({ behavior: 'smooth' }); $('usd').focus(); };
+$('start').onclick = () => api('/api/start', {}).then(refresh, showErr);
+$('pause').onclick = () => api('/api/pause', {}).then(refresh, showErr);
+$('stop').onclick = () => { if (confirm('Stop after the current step and quit? Progress is saved; double-click the miner again to resume.')) api('/api/stop', {}).then(() => ($('phase').textContent = 'stopped: you can close this tab'), showErr); };
+for (const el of document.querySelectorAll('input[type=radio]'))
+  el.onchange = () => api('/api/dest', { names: document.querySelector('input[name=names]:checked').value, pay: document.querySelector('input[name=pay]:checked').value, identityKey }).then(refresh, (e) => { showErr(e); refresh(); });
+$('qr').src = '/qr.svg?t=' + T;
+refresh().then(() => { if (st) $('usd').value = st.defaultFundUsd; });
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
