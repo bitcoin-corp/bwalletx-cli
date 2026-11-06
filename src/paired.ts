@@ -112,7 +112,7 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void)
     // In order: the phone's ready can arrive while hello is still deriving the key.
     ws.on('message', inOrder(async (raw: unknown) => {
       // A bad frame from the relay must not crash the CLI (an unhandled rejection ends the process).
-      const f = parseFrame(raw as Parameters<typeof parseFrame>[0]);
+      const f = parseFrame(raw);
       if (!f) return;
       if ((f as HelloFrame).t === 'hello' && !sealer) {
         if (!/^0[23][0-9a-f]{64}$/i.test(String((f as HelloFrame).k))) return;
