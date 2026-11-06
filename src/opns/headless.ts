@@ -58,7 +58,10 @@ export const treePath = (account: string) => join(home(), `opns-tree-${safe(acco
 
 /** OpNS node script is ~5,975 bytes; per-character fee at 100 sat/kB (bWalletX estimateMintFee). */
 export const NODE_SCRIPT_LEN = 6000;
-export const PER_CHAR_SATS = estimateMintFee(NODE_SCRIPT_LEN);
+/** Real mint txs measure ~18.6 kB and pay ~1,920 sats (e.g. 2408659c…ef22, 24 Oct 2026), about 3x the
+ *  script-size estimate, so budgets and ETAs use whichever is higher. */
+export const MEASURED_MINT_FEE_SATS = 1_950;
+export const PER_CHAR_SATS = Math.max(estimateMintFee(NODE_SCRIPT_LEN), MEASURED_MINT_FEE_SATS);
 /** One OrdLock v2 listing tx (name input + funding + change) — bWalletX OPNS_LIST_FEE_ESTIMATE. */
 export const LIST_FEE_SATS = 200;
 
