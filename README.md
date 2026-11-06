@@ -329,7 +329,7 @@ accounts need `BWALLETX_PASSPHRASE` in the MCP env, paired accounts sign on the 
 | `buy_listing` | buy one listing by outpoint, like `buy-listing` (+1% market fee; gated as `buy`; optional `maxUsd`; `dryRun` builds only) |
 | `list_products` | bWalletX Store products agents can buy ($1 themes, $99/year Theme edition, Branded edition from $999 by quote) |
 | `quote` | signed 5-minute single-use quote: USD, sats at the live rate, MNEE amount (nothing paid) |
-| `buy_product` | quote → check → gate → pay from the BRC-100 wallet → server verifies + broadcasts → granted to this identity key (gated like `send`; `maxUsd`; `dryRun` builds only; API: `BWALLETX_STORE_API`, default https://pay.bwallet.space) |
+| `buy_product` | quote → check → gate → pay from the BRC-100 wallet: the Store records it, the wallet broadcasts it, then the claim → granted to this identity key once the network has the payment (gated like `send`; `maxUsd`; `dryRun` builds only; API: `BWALLETX_STORE_API`, default https://pay.bwallet.space). `pending: true` = not bought yet: see "Store answers" below |
 | `strategy_show` | the loaded strategy, mode and paper book |
 | `strategy_load` | load a strategy file, always in **paper** mode |
 | `log` | recent activity log entries |
@@ -350,6 +350,26 @@ them either. An agent can stop things (`stop_all`, `lower_cap`) but never turn t
 
 `mint` publishes files on chain for anyone to read, so over MCP it only reads the mint folder. Put the files you
 want minted there yourself.
+
+**Store answers.** The bWalletX Store marks a purchase paid only once the network has the payment
+([agent.json](https://bwalletx.com/.well-known/agent.json)):
+
+- `200`: bought. The product is granted to the account's identity key.
+- `202` with `pending: true`: the payment is pending, **not bought yet**. The Store has recorded it, but the network
+  hasn't shown it yet. Don't pay again. The same buy request (same `quote_id`, `txid` and `rawtx`) answers `200` once
+  the network has the payment, even after the quote expired.
+- `409 payment_pending`: a payment for this product (or this quote) is already on its way. Don't pay again.
+
+`buy_product` pays as the bWalletX app does: the Store first records the payment (an intent, nothing posted),
+then the account's own wallet broadcasts it, so its change is spendable straight away, then it claims.
+
+- **Bought:** `ok: true` and the text starts "Bought".
+- **Pending:** `ok: true, pending: true` and the text starts "Pending, not bought yet". The tool asks again three
+  times over about 30 s first. Don't pay again: the Store grants it once the network has the payment, even after the
+  quote expires. For a theme, calling `buy_product` again is safe; it answers "already on its way" until then.
+- **409 `payment_pending`** at quote time: `ok: false, pending: true`, and nothing is built or paid.
+- The payment is released only when the Store refused the intent, so nothing was broadcast. After the broadcast it
+  is never released; a refused claim says so with the txid.
 
 **Claude Code**
 
