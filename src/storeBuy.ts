@@ -3,7 +3,11 @@
  * deposit from $999 by quote). Talks to the agent purchase API (yours-mobile site/api/agent-buy.js):
  *   GET  <api>/api/agent/products
  *   POST <api>/api/agent/quote   signed by the account's identity key (action agent-buy-quote)
- *   POST <api>/api/agent/buy     signed (agent-buy-claim) + the payment, built unsent; the server checks it and broadcasts
+ *   POST <api>/api/agent/buy     signed (agent-buy-claim) + the payment. As the bWalletX app does since the wallet
+ *                                recovery release: an intent first (the Store records the txid, posts nothing), then
+ *                                the account's own wallet broadcasts it, then the claim. 200 = bought; 202 = pending,
+ *                                NOT bought yet (repeated a few times, then reported as pending); 409 payment_pending =
+ *                                a payment for it is already on its way.
  * The payment comes from the account's own BRC-100 wallet and passes the same gate as every spend (kill switch,
  * daily cap, rate limit, strategy rules; paper mode never signs). The quote is checked here too before paying:
  * the dollar price must be within maxUsd and the sats must match it at our own BSV rate.
@@ -47,6 +51,8 @@ export type StoreDeps = {
   stopped: () => boolean;
   log: (name: string, e: AgentLogEntry) => void;
   now: () => number;
+  /** Waits between repeats of a pending claim. */
+  sleep: (ms: number) => Promise<void>;
 };
 
 const defaultDeps = (): StoreDeps => ({
@@ -58,6 +64,7 @@ const defaultDeps = (): StoreDeps => ({
     return { name, wallet: w.wallet as unknown as WalletInterface, close: () => w.close() };
   },
   rate: bsvUsd,
+  sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
   gate: (name, a) => gateAction(name, a),
   stopped: allStopped,
   log: appendLog,
@@ -97,6 +104,14 @@ async function call<T>(d: StoreDeps, path: string, body?: unknown): Promise<T> {
   const j = (await r.json().catch(() => ({}))) as Record<string, unknown>;
   if (!r.ok) throw new StoreError(`Store refused (${r.status}): ${String(j.error ?? 'error')}`, String(j.error ?? `http_${r.status}`), r.status);
   return j as T;
+}
+
+/** As call, but 2xx answers come back with their status: 200 = bought, 202 = pending (not bought yet). */
+async function callStatus(d: StoreDeps, path: string, body: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
+  const r = await d.fetch(`${d.api()}/api/agent/${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const j = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!r.ok) throw new StoreError(`Store refused (${r.status}): ${String(j.error ?? 'error')}`, String(j.error ?? `http_${r.status}`), r.status);
+  return { status: r.status, body: j };
 }
 
 /** The catalogue: every product with its dollar price and the fields `quote` needs. */
@@ -139,15 +154,64 @@ export function checkQuote(q: Quote, o: { product: Product; maxUsd: number; rate
 }
 
 export type BuyOpts = QuoteOpts & { maxUsd: number; dryRun?: boolean };
-export type BuyResult = { ok: boolean; text: string; dryRun?: boolean; quote?: Quote; built?: BuiltTx; txid?: string; result?: unknown };
+export type BuyResult = {
+  ok: boolean;
+  text: string;
+  /** The payment is out (or another one is) but the network hasn't shown it yet: NOT bought yet. */
+  pending?: boolean;
+  dryRun?: boolean;
+  quote?: Quote;
+  built?: BuiltTx;
+  txid?: string;
+  result?: unknown;
+};
 
-/** Quote → check → gate → build the payment unsent → the server checks + broadcasts → granted to this identity key. */
+/** How often a 202 claim is asked again, and the waits before each (the Store answers 200 once the network has it). */
+export const PENDING_REPEATS_MS = [5_000, 10_000, 15_000];
+
+/**
+ * Send the unsent payment through the account's own wallet (createAction sendWith): its broadcaster posts the payment
+ * with its ancestors, and the action leaves `nosend`, so its change can be spent again. 'refused' only when the
+ * network answered no for this txid; anything unclear is 'unknown' and the payment is kept.
+ */
+async function sendOwnPayment(w: WalletInterface, txid: string): Promise<'sent' | 'refused' | 'unknown'> {
+  const refused = new Set(['failed', 'invalidTx', 'doubleSpend']);
+  const verdict = (rows: unknown): string | undefined =>
+    Array.isArray(rows) ? (rows as { txid?: string; status?: string }[]).find((x) => x?.txid === txid)?.status : undefined;
+  try {
+    const r = await w.createAction({ description: 'bWalletX Store payment', options: { sendWith: [txid], acceptDelayedBroadcast: false } });
+    const st = verdict(r.sendWithResults);
+    return st === undefined ? 'unknown' : refused.has(st) ? 'refused' : 'sent';
+  } catch (e) {
+    const x = e as { sendWithResults?: unknown; reviewActionResults?: unknown };
+    const st = verdict(x?.sendWithResults) ?? verdict(x?.reviewActionResults);
+    return st !== undefined && refused.has(st) ? 'refused' : 'unknown';
+  }
+}
+
+/**
+ * Quote → check → gate → build the payment unsent → claim intent (the Store records the txid, posts nothing) → the
+ * account's own wallet broadcasts it → claim. 200 = bought, granted to this identity key; 202 = pending, not bought yet.
+ * The payment is released only when nothing was broadcast (the intent was refused). Once the wallet has sent it, it is
+ * never released, whatever the Store answers.
+ */
 export async function buy(o: BuyOpts): Promise<BuyResult> {
   const d = deps();
   if (!o.dryRun && d.stopped()) return { ok: false, text: 'Refused: all agents are stopped (bwalletx resume)' };
   const acct = await d.open(o.account);
   try {
-    const q = await quoteWith(d, acct.wallet, o);
+    let q: Quote;
+    try {
+      q = await quoteWith(d, acct.wallet, o);
+    } catch (e) {
+      if (e instanceof StoreError && e.code === 'payment_pending')
+        return {
+          ok: false,
+          pending: true,
+          text: 'Not paying again: a payment for this is already on its way (409 payment_pending). It completes once the network has it.',
+        };
+      throw e;
+    }
     const bad = checkQuote(q, { product: o.product, maxUsd: o.maxUsd, rate: await d.rate().catch(() => 0), now: d.now() });
     if (bad) return { ok: false, text: `Refused: ${bad}`, quote: q };
     const args: CreateActionArgs = {
@@ -170,18 +234,68 @@ export async function buy(o: BuyOpts): Promise<BuyResult> {
     if (g.paper) return { ok: false, text: 'Paper mode: nothing is signed (load the strategy --live, or unload it)', quote: q };
     const r = await acct.wallet.createAction(args);
     if (!r.txid || !r.tx) throw new Error('The wallet did not build the payment');
+    const txid = r.txid;
     const rawtx = Utils.toHex(r.tx);
+    const claimBody = async (intent: boolean) => ({
+      ...(await signRequest(acct.wallet, 'agent-buy-claim', { product: o.product, quote_id: q.quote_id, txid, ...(intent ? { intent: '1' } : {}) }, d.now())),
+      rawtx,
+    });
+    const failed = (detail: string) => d.log(acct.name, { at: d.now(), action: 'failed', detail: `Store buy ${o.product}: ${detail}`, usd: 0, txid });
+
+    // 1. Intent: the Store checks the payment and records its txid. Nothing is posted, so a refusal releases it.
     try {
-      const claim = await call<Record<string, unknown>>(d, 'buy', { ...(await signRequest(acct.wallet, 'agent-buy-claim', { product: o.product, quote_id: q.quote_id, txid: r.txid }, d.now())), rawtx });
-      const text = `Bought ${label}`;
-      d.log(acct.name, { at: d.now(), action: 'buy', detail: `${text} quote ${q.quote_id}`, usd: q.usd, txid: r.txid });
-      return { ok: true, text, txid: r.txid, quote: q, result: claim };
+      await callStatus(d, 'buy', await claimBody(true));
     } catch (e) {
-      // Refused before broadcast (4xx): release the unsent payment. A 502 may follow a broadcast the network took: keep it.
-      if (e instanceof StoreError && e.status >= 400 && e.status < 500) await acct.wallet.abortAction({ reference: r.txid }).catch(() => null);
-      d.log(acct.name, { at: d.now(), action: 'failed', detail: `Store buy ${o.product} failed: ${e instanceof Error ? e.message : String(e)}`, usd: 0, txid: r.txid });
+      await acct.wallet.abortAction({ reference: txid }).catch(() => null);
+      failed(`not sent, released: ${e instanceof Error ? e.message : String(e)}`);
       throw e;
     }
+
+    // 2. The account's own wallet broadcasts it (ancestors included) and its change becomes spendable.
+    const sent = await sendOwnPayment(acct.wallet, txid);
+    if (sent === 'refused') {
+      failed('the network refused the payment');
+      return { ok: false, text: `Not bought: the network refused the payment for ${label}. Nothing was paid.`, txid, quote: q };
+    }
+
+    // 3. Claim. From here the payment is out: never released, whatever the answer.
+    let claim: { status: number; body: Record<string, unknown> } | undefined;
+    let lastError: unknown;
+    for (let i = 0; i <= PENDING_REPEATS_MS.length; i++) {
+      if (i > 0) await d.sleep(PENDING_REPEATS_MS[i - 1]);
+      try {
+        claim = await callStatus(d, 'buy', await claimBody(false));
+        lastError = undefined;
+        if (claim.status === 200) break;
+      } catch (e) {
+        lastError = e;
+        if (!(e instanceof StoreError && e.status === 502)) break;
+      }
+    }
+    if (claim?.status === 200) {
+      const text = `Bought ${label}`;
+      d.log(acct.name, { at: d.now(), action: 'buy', detail: `${text} quote ${q.quote_id}`, usd: q.usd, txid });
+      return { ok: true, text, txid, quote: q, result: claim.body };
+    }
+    if (lastError instanceof StoreError && lastError.status >= 400 && lastError.status < 500) {
+      failed(`sent, but the Store refused the claim: ${lastError.message}`);
+      return {
+        ok: false,
+        text: `The payment for ${label} was sent, but the Store refused the claim (${lastError.code}). It is not released; email support@bwalletx.com with the txid.`,
+        txid,
+        quote: q,
+      };
+    }
+    const why = lastError instanceof Error ? ` (${lastError.message})` : '';
+    d.log(acct.name, { at: d.now(), action: 'buy', detail: `Pending, not bought yet: ${label} quote ${q.quote_id}${why}`, usd: q.usd, txid });
+    return {
+      ok: true,
+      pending: true,
+      text: `Pending, not bought yet: the payment for ${label} is sent, but the network hasn't shown it yet${why}. Don't pay again: the Store grants it once the network has it, even after the quote expires.`,
+      txid,
+      quote: q,
+      result: claim?.body,
+    };
   } finally {
     await acct.close();
   }

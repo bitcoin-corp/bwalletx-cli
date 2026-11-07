@@ -263,7 +263,7 @@ export function createMcpServer(version: string, opts: McpOptions = {}) {
     'buy_product',
     {
       description:
-        'Buy a Store product from the account\'s BRC-100 wallet: quote → check (price within maxUsd, sats match our BSV rate) → gate → the server checks the payment and broadcasts → granted to this identity key, with a Store receipt. Gated like send: per-call limit (BWALLETX_MCP_MAX_USD, default $5, so the $99 edition needs it raised), kill switch, daily cap, rate limit, strategy rules; paper mode refuses. dryRun quotes and builds only. Named buy_product because `buy` is the BSV-21 token buy.',
+        'Buy a Store product from the account\'s BRC-100 wallet: quote → check (price within maxUsd, sats match our BSV rate) → gate → the Store records the payment → the wallet broadcasts it → claim → granted to this identity key once the network has it, with a Store receipt. A result with pending: true is NOT bought yet: don\'t pay again, it completes once the network has the payment. Gated like send: per-call limit (BWALLETX_MCP_MAX_USD, default $5, so the $99 edition needs it raised), kill switch, daily cap, rate limit, strategy rules; paper mode refuses. dryRun quotes and builds only. Named buy_product because `buy` is the BSV-21 token buy.',
       inputSchema: { product, fields: productFields, maxUsd: z.number().positive(), account, dryRun },
     },
     wrap(async (o: { product: storeBuy.Product; fields?: Record<string, unknown>; maxUsd: number; account?: string; dryRun?: boolean }) => overLimit(o.maxUsd, 'spends') ?? needPass(o.dryRun) ?? storeBuy.buy(o)),
