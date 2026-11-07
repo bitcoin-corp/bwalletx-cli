@@ -29,7 +29,7 @@ export const digitNames = (max = MAX_DIGITS): string[] => {
 };
 
 /**
- * Default top-up from the extension, in dollars. At ~$17/BSV the whole digit list (11,110 characters × ~1,881
- * sats ≈ 0.21 BSV) costs about $4, so $5 covers it; the cap (1 BSV) is about $17.
+ * Default top-up from the extension, in dollars. At ~$17/BSV the whole digit list (11,110 characters × ~1,950
+ * sats ≈ 0.22 BSV) costs about $4, so $5 covers it; the cap (1 BSV) is about $17.
  */
 export const DEFAULT_FUND_USD = 5;
