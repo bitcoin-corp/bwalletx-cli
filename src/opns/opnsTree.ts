@@ -81,6 +81,18 @@ export class OpnsTree {
     return norm(outpoint) in this.s.spent;
   }
 
+  /** When we marked this outpoint spent (ms), or undefined. */
+  spentAt(outpoint: string): number | undefined {
+    return this.s.spent[norm(outpoint)];
+  }
+
+  /** The chain says this outpoint is unspent after all: our spend never landed (24 Oct 2026, "he"). */
+  unmarkSpent(outpoint: string) {
+    if (!this.isSpent(outpoint)) return;
+    delete this.s.spent[norm(outpoint)];
+    this.save();
+  }
+
   markSpent(outpoint: string) {
     const op = norm(outpoint);
     if (this.isSpent(op)) return;

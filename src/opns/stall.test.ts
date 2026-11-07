@@ -3,7 +3,7 @@
 import { describe, expect, test } from 'vitest';
 import type { Transaction } from '@bsv/sdk';
 import { OpnsTree, type KV } from './opnsTree.js';
-import { mineName, GHOST_MS, type MineChar } from './opnsRegister.js';
+import { mineName, liveIndexed, GHOST_MS, type MineChar } from './opnsRegister.js';
 import { loudSleep, waitForNextBlock, HEARTBEAT_MS } from './batch.js';
 import type { Fetch } from './services.js';
 
@@ -111,5 +111,29 @@ describe('loud waits', () => {
     await waitForNextBlock(f, async () => void (++n === 3 && (h = 101)), new AbortController().signal, 30 * 60_000, 30_000, (m) => logs.push(m));
     expect(logs.length).toBe(3);
     expect(logs[0]).toMatch(/Waiting for the next block \(height 100/);
+  });
+});
+
+describe('stale spent mark on a live indexer node (24 Oct 2026, "he")', () => {
+  const OP = 'a'.repeat(64) + '.0';
+  const node = { outpoint: OP, domain: 'he' };
+  const woc = (status: number): Fetch => (async () => new Response('', { status })) as unknown as Fetch;
+
+  test('an old mark on an outpoint the chain calls unspent is cleared and the node is used', async () => {
+    const tree = new OpnsTree(memKV(), 'k', () => Date.now() - GHOST_MS - 1);
+    tree.markSpent(OP);
+    const live = await liveIndexed({ ctx: {} as never, fetch: woc(404), tree }, node);
+    expect(live?.outpoint).toBe(OP);
+    expect(tree.isSpent(OP)).toBe(false);
+  });
+
+  test('a fresh mark (our mint may still be in flight) or an unclear answer keeps it', async () => {
+    const fresh = new OpnsTree(memKV(), 'k', () => Date.now());
+    fresh.markSpent(OP);
+    expect(await liveIndexed({ ctx: {} as never, fetch: woc(404), tree: fresh }, node)).toBeNull();
+    const old = new OpnsTree(memKV(), 'k', () => Date.now() - GHOST_MS - 1);
+    old.markSpent(OP);
+    expect(await liveIndexed({ ctx: {} as never, fetch: woc(429), tree: old }, node)).toBeNull();
+    expect(old.isSpent(OP)).toBe(true);
   });
 });
