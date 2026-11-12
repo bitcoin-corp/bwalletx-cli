@@ -14,15 +14,20 @@ import WebSocket from 'ws';
 import { existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+  CLAIM_FORMAT,
   DEFAULT_RELAY,
   PAIR_VERSION,
   QR_LIFETIME_S,
   Sealer,
+  claimDigest,
   deriveSession,
   isSealed,
   newChannel,
+  newClaim,
   pairUrl,
   relaySocketUrl,
+  sessionWalletClaim,
+  walletClaimFor,
   type HelloFrame,
   type PairMessage,
 } from './pair/protocol.js';
@@ -52,6 +57,10 @@ export type Pairing = {
   mode?: 'agent' | 'brc100';
   /** The limits the phone set for a brc100 pairing (informational: the phone enforces them). */
   caps?: Brc100Caps | null;
+  /** Our relay site claim, sent on every connect. Pairings saved before it get one on their next connect. */
+  sc?: string;
+  /** 2: the relay binds the phone's role to the pairing's session claim (wallet claim v2); we re-bind it on connect. */
+  wv?: 2;
 };
 export type Brc100Caps = { dailyUsd?: number; perCallUsd?: number; origins?: string[] };
 export type LoginOptions = { mode?: 'agent' | 'brc100' };
@@ -74,6 +83,25 @@ export const parseFrame = (raw: unknown): unknown => {
 
 const open = (url: string) => new WebSocket(url, { headers: { Origin: CLI_ORIGIN }, handshakeTimeout: 10_000 });
 
+/**
+ * The site socket URL for a saved pairing. Always carries our site claim (one is created and saved for pairings from
+ * before claims), and for a v2 pairing the session claim digest, so a channel the relay re-creates admits only the
+ * paired phone. Exported for tests.
+ */
+export function pairedSiteUrl(p: Pairing, expiry: number, save: (p: Pairing) => void = savePairing): string {
+  if (!p.sc || !CLAIM_FORMAT.test(p.sc)) {
+    p.sc = newClaim();
+    save(p);
+  }
+  const wc = p.wv === 2 ? claimDigest(sessionWalletClaim(PrivateKey.fromHex(p.s), p.k, p.c)) : undefined;
+  return relaySocketUrl(p.r, p.c, 'site', expiry, p.sc, wc);
+}
+
+/** The site socket URL for a new pairing: our site claim, and the digest of the claim only the QR gives (`wc`). */
+export function newChannelUrl(relay: string, c: string, sitePub: string, expiry: number, sc: string): string {
+  return relaySocketUrl(relay, c, 'site', expiry, sc, claimDigest(walletClaimFor(c, sitePub)));
+}
+
 /** `bwalletx login`: show a QR, wait for the phone, save the pairing as account `name`. */
 export async function login(name: string, opts: LoginOptions = {}, out: (s: string) => void = console.log): Promise<Pairing> {
   if (!/^[A-Za-z0-9._-]{1,40}$/.test(name) || name.startsWith('.')) throw new Error(`Bad account name "${name}"`);
@@ -91,10 +119,12 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void)
   const c = newChannel();
   const e = Math.floor(Date.now() / 1000) + QR_LIFETIME_S;
   const link = pairUrl({ v: PAIR_VERSION, r: DEFAULT_RELAY, c, k: S.toPublicKey().toString(), o: CLI_ORIGIN, e });
+  const sc = newClaim();
   return new Promise((resolve, reject) => {
-    const ws = open(relaySocketUrl(DEFAULT_RELAY, c, 'site', e));
+    const ws = open(newChannelUrl(DEFAULT_RELAY, c, S.toPublicKey().toString(), e, sc));
     let sealer: Sealer | null = null;
     let phoneKey = '';
+    let v2 = false;
     let infoId = '';
     const timer = setTimeout(() => !sealer && (ws.close(), resolve(null)), QR_LIFETIME_S * 1000 - 5000);
     ws.on('open', async () => {
@@ -118,6 +148,7 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void)
         if (!/^0[23][0-9a-f]{64}$/i.test(String((f as HelloFrame).k))) return;
         clearTimeout(timer);
         phoneKey = (f as HelloFrame).k;
+        v2 = (f as HelloFrame).wcv === 2;
         const { key, code } = await deriveSession(S, phoneKey, c);
         sealer = new Sealer(key, 'site');
         out(`Check your phone shows the code  ${code}  then choose what the CLI may do and tap Pair.`);
@@ -149,6 +180,8 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void)
           mint: i.mint ?? null,
           mode,
           ...(mode === 'brc100' && { caps: i.caps ?? null }),
+          sc,
+          ...(v2 && { wv: 2 as const }),
         };
         savePairing(p);
         const cfg = readConfig();
@@ -216,7 +249,7 @@ export class PhoneSession {
     this.sealer = new Sealer(key, 'site');
     this.sealer.restore({ sent: p.sent, lastSeen: p.lastSeen });
     // A fresh expiry lets the relay recreate the channel if it was dropped; the phone rejoins on its own.
-    this.ws = open(relaySocketUrl(p.r, p.c, 'site', Math.floor(Date.now() / 1000) + QR_LIFETIME_S - 10));
+    this.ws = open(pairedSiteUrl(p, Math.floor(Date.now() / 1000) + QR_LIFETIME_S - 10));
     await new Promise<void>((resolve, reject) => {
       this.ws.once('open', () => resolve());
       this.ws.once('error', (e) => reject(new Error(`Pairing service unreachable: ${e.message}`)));
@@ -317,7 +350,7 @@ export async function unpair(name: string) {
     const { key } = await deriveSession(PrivateKey.fromHex(p.s), p.k, p.c);
     const sealer = new Sealer(key, 'site');
     sealer.restore({ sent: p.sent, lastSeen: p.lastSeen });
-    const ws = open(relaySocketUrl(p.r, p.c, 'site', Math.floor(Date.now() / 1000) + 100));
+    const ws = open(pairedSiteUrl(p, Math.floor(Date.now() / 1000) + 100));
     await new Promise<void>((res) => {
       ws.on('open', async () => (ws.send(JSON.stringify(await sealer.seal({ t: 'close', reason: 'cli logout' }))), setTimeout(res, 500)));
       ws.on('error', () => res());

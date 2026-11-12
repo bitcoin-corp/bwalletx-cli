@@ -6,6 +6,7 @@ A safety release. If you let an AI agent use bwalletx, upgrade.
 
 ### What changes for you
 
+- **Pairing sends relay claims.** `bwalletx login` now opens its channel with a site claim and the digest of the QR-bound wallet claim (`wc`), and every connect sends the saved site claim (pairings saved before this get one on their next connect). Before this the CLI sent no claim, so the relay would refuse it after its compatibility window ends on 30 Nov 2026. With a phone on wallet claim v2 (the hello says `wcv: 2`), the pairing saves `wv: 2` and each connect re-binds the phone's role with the session claim digest, which only the phone and the CLI can compute.
 - **`buy_product` no longer calls a pending payment "Bought".** The bWalletX Store now marks a purchase paid only
   once the network has the payment, and answers 202 until then. `buy_product` reports that as `pending: true`,
   "Pending, not bought yet", after asking again for about 30 s. A 409 `payment_pending` at quote time means a payment
