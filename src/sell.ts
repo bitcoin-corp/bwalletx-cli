@@ -39,7 +39,7 @@ import {
 } from '@1sat/actions';
 import { LockingScript, P2PKH, PublicKey, Transaction, type CreateActionArgs, type CreateActionOutput, type Script, type WalletInterface, type WalletOutput } from '@bsv/sdk';
 import { MARKET_FEE_ADDRESS, MARKET_FEE_RATE, marketFeeSats } from './buy.js';
-import { gateAction } from './gate.js';
+import { gateAction, reserveSpend, type Reserved } from './gate.js';
 import { bsvUsd, outpointUnspent, overlayFee } from './market.js';
 import { allStopped, appendLog, home, readJsonFile, writeJsonFile } from './store.js';
 import { rawTx } from './wallet.js';
@@ -150,6 +150,8 @@ export type SellDeps = {
   rate: () => Promise<number>;
   overlayFee: (tokenId: string) => Promise<{ address: string; sats: number } | null>;
   gate: (name: string, a: ActionRequest) => { ok: true; paper: boolean } | { ok: false; reason: string };
+  /** Buys: gate + reserve the dollars before signing (gate.ts reserveSpend); settled or released after. */
+  reserve: (name: string, a: ActionRequest) => Promise<Reserved>;
   stopped: () => boolean;
   log: (name: string, e: AgentLogEntry) => void;
   records: { load: (name: string) => TokenRecord[]; save: (name: string, r: TokenRecord[]) => void };
@@ -242,6 +244,7 @@ const defaultDeps = (): SellDeps => ({
   rate: bsvUsd,
   overlayFee,
   gate: (name, a) => gateAction(name, a),
+  reserve: (name, a) => reserveSpend(name, a),
   stopped: allStopped,
   log: appendLog,
   records: {
@@ -530,16 +533,28 @@ export async function buyListing(o: BuyListingOpts): Promise<SellResult> {
       const { built } = await run(true);
       return { ok: true, dryRun: true, built, sats, outpoint: op.us, text: `Dry run: buy ${what} (OrdLock ${l.v2 ? 'v2' : 'v1'}) for ≈ ${fmtUsd(usd)}: ${breakdown}. Built the purchase (${built!.inputs} input(s), ${built!.outputs.length} output(s)); nothing signed, nothing broadcast.` };
     }
-    const refused = refuseSpend(d, acct.name, { kind: 'buy', token: l.token?.id ?? 'ordinal', usd, ...(l.token && { amount: Number(l.token.amount) }) });
-    if (refused) return { ok: false, text: refused };
-    if (o.confirm && !(await o.confirm(`Buy ${what} for ≈ ${fmtUsd(usd)} (${breakdown}) from ${acct.name}?`))) return { ok: false, text: 'Not confirmed (pass --yes to skip)' };
-    if (!(await d.unspent(op.us))) return { ok: false, text: `${op.us} was just bought or cancelled` };
-    const { res } = await run(false);
-    const txid = txidFromResult(res, 'Purchase');
-    await acct.sendWaiting();
-    const text = `Bought ${what} for ≈ ${fmtUsd(usd)} (${sats} sats + network fee)`;
-    d.log(acct.name, { at: Date.now(), action: 'buy', detail: `${text} ${op.us}`, usd, txid });
-    return { ok: true, text, txid, outpoint: op.us, sats };
+    // The dollars are reserved before signing, so parallel buys can't all pass the cap (gate.ts reserveSpend).
+    const g = await d.reserve(acct.name, { kind: 'buy', token: l.token?.id ?? 'ordinal', usd, ...(l.token && { amount: Number(l.token.amount) }) });
+    if (!g.ok) return { ok: false, text: `Refused: ${g.reason}` };
+    if (g.paper) return { ok: false, text: 'Paper mode: nothing is signed (load the strategy --live, or unload it)' };
+    let state: 'idle' | 'signing' | 'done' = 'idle';
+    try {
+      if (o.confirm && !(await o.confirm(`Buy ${what} for ≈ ${fmtUsd(usd)} (${breakdown}) from ${acct.name}?`))) return { ok: false, text: 'Not confirmed (pass --yes to skip)' };
+      if (!(await d.unspent(op.us))) return { ok: false, text: `${op.us} was just bought or cancelled` };
+      state = 'signing';
+      const { res } = await run(false);
+      if (res.error || !res.txid) state = 'idle'; // the builder answered with an error: nothing was broadcast
+      const txid = txidFromResult(res, 'Purchase');
+      await acct.sendWaiting();
+      const text = `Bought ${what} for ≈ ${fmtUsd(usd)} (${sats} sats + network fee)`;
+      state = 'done';
+      g.settle({ at: Date.now(), action: 'buy', detail: `${text} ${op.us}`, usd, txid });
+      return { ok: true, text, txid, outpoint: op.us, sats };
+    } finally {
+      // A throw while signing/broadcasting may still have sent it: counted. Nothing left the account: released.
+      if (state === 'signing') g.settle({ at: Date.now(), action: 'failed', detail: `Buy ${what} ${op.us} interrupted (may have been broadcast: counted against the cap)`, usd });
+      else if (state === 'idle') g.release();
+    }
   } finally {
     await acct.close();
   }

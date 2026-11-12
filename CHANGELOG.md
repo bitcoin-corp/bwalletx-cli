@@ -6,6 +6,12 @@ A safety release. If you let an AI agent use bwalletx, upgrade.
 
 ### What changes for you
 
+- **Spends reserve their dollars before signing.** Store buys and `buy-listing` now reserve the amount against the
+  daily cap before anything is signed, so two requests at once can't both pass it. A spend that may have gone out
+  stays counted even if the process stops half way; one that didn't is released.
+- **OpNS name transfers go through the gate.** `opns sweep`, `opns send` and `opns unlist` treat each name as a send
+  valued at its listing tier: the kill switch, daily cap, approval threshold, rate limit and strategy rules apply.
+  Moving many names may need the cap raised for the run (owner PIN).
 - **`buy_product` no longer calls a pending payment "Bought".** The bWalletX Store now marks a purchase paid only
   once the network has the payment, and answers 202 until then. `buy_product` reports that as `pending: true`,
   "Pending, not bought yet", after asking again for about 30 s. A 409 `payment_pending` at quote time means a payment

@@ -9,14 +9,15 @@
  *                                NOT bought yet (repeated a few times, then reported as pending); 409 payment_pending =
  *                                a payment for it is already on its way.
  * The payment comes from the account's own BRC-100 wallet and passes the same gate as every spend (kill switch,
- * daily cap, rate limit, strategy rules; paper mode never signs). The quote is checked here too before paying:
+ * daily cap, rate limit, strategy rules; paper mode never signs). Its dollars are reserved before signing, so
+ * parallel buys can't all pass the cap, and stay counted once the payment may have left. The quote is checked here too before paying:
  * the dollar price must be within maxUsd and the sats must match it at our own BSV rate.
  * Env: BWALLETX_STORE_API (default https://pay.bwallet.space).
  */
 import { Utils, type CreateActionArgs, type WalletInterface } from '@bsv/sdk';
-import { gateAction } from './gate.js';
+import { reserveSpend, type Reserved } from './gate.js';
 import { bsvUsd } from './market.js';
-import { allStopped, appendLog } from './store.js';
+import { allStopped } from './store.js';
 import { dryRunWallet, summariseArgs, type BuiltTx } from './sell.js';
 import type { ActionRequest, AgentLogEntry } from './strategy.js';
 
@@ -47,9 +48,9 @@ export type StoreDeps = {
   fetch: typeof fetch;
   open: (account?: string) => Promise<StoreAccount>;
   rate: () => Promise<number>;
-  gate: (name: string, a: ActionRequest) => { ok: true; paper: boolean } | { ok: false; reason: string };
+  /** Gate + reserve the dollars before signing (gate.ts reserveSpend); settled or released after. */
+  reserve: (name: string, a: ActionRequest) => Promise<Reserved>;
   stopped: () => boolean;
-  log: (name: string, e: AgentLogEntry) => void;
   now: () => number;
   /** Waits between repeats of a pending claim. */
   sleep: (ms: number) => Promise<void>;
@@ -65,9 +66,8 @@ const defaultDeps = (): StoreDeps => ({
   },
   rate: bsvUsd,
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
-  gate: (name, a) => gateAction(name, a),
+  reserve: (name, a) => reserveSpend(name, a),
   stopped: allStopped,
-  log: appendLog,
   now: () => Date.now(),
 });
 let override: Partial<StoreDeps> | null = null;
@@ -229,73 +229,91 @@ export async function buy(o: BuyOpts): Promise<BuyResult> {
       const built = dry.captured[0] ? summariseArgs(dry.captured[0]) : undefined;
       return { ok: true, dryRun: true, quote: q, built, text: `Dry run: buy ${label}. Nothing signed, nothing broadcast.` };
     }
-    const g = d.gate(acct.name, { kind: 'buy', token: 'bwalletx-store', usd: q.usd });
+    const g = await d.reserve(acct.name, { kind: 'buy', token: 'bwalletx-store', usd: q.usd });
     if (!g.ok) return { ok: false, text: `Refused: ${g.reason}`, quote: q };
     if (g.paper) return { ok: false, text: 'Paper mode: nothing is signed (load the strategy --live, or unload it)', quote: q };
-    const r = await acct.wallet.createAction(args);
-    if (!r.txid || !r.tx) throw new Error('The wallet did not build the payment');
-    const txid = r.txid;
-    const rawtx = Utils.toHex(r.tx);
-    const claimBody = async (intent: boolean) => ({
-      ...(await signRequest(acct.wallet, 'agent-buy-claim', { product: o.product, quote_id: q.quote_id, txid, ...(intent ? { intent: '1' } : {}) }, d.now())),
-      rawtx,
-    });
-    const failed = (detail: string) => d.log(acct.name, { at: d.now(), action: 'failed', detail: `Store buy ${o.product}: ${detail}`, usd: 0, txid });
-
-    // 1. Intent: the Store checks the payment and records its txid. Nothing is posted, so a refusal releases it.
-    try {
-      await callStatus(d, 'buy', await claimBody(true));
-    } catch (e) {
-      await acct.wallet.abortAction({ reference: txid }).catch(() => null);
-      failed(`not sent, released: ${e instanceof Error ? e.message : String(e)}`);
-      throw e;
-    }
-
-    // 2. The account's own wallet broadcasts it (ancestors included) and its change becomes spendable.
-    const sent = await sendOwnPayment(acct.wallet, txid);
-    if (sent === 'refused') {
-      failed('the network refused the payment');
-      return { ok: false, text: `Not bought: the network refused the payment for ${label}. Nothing was paid.`, txid, quote: q };
-    }
-
-    // 3. Claim. From here the payment is out: never released, whatever the answer.
-    let claim: { status: number; body: Record<string, unknown> } | undefined;
-    let lastError: unknown;
-    for (let i = 0; i <= PENDING_REPEATS_MS.length; i++) {
-      if (i > 0) await d.sleep(PENDING_REPEATS_MS[i - 1]);
-      try {
-        claim = await callStatus(d, 'buy', await claimBody(false));
-        lastError = undefined;
-        if (claim.status === 200) break;
-      } catch (e) {
-        lastError = e;
-        if (!(e instanceof StoreError && e.status === 502)) break;
-      }
-    }
-    if (claim?.status === 200) {
-      const text = `Bought ${label}`;
-      d.log(acct.name, { at: d.now(), action: 'buy', detail: `${text} quote ${q.quote_id}`, usd: q.usd, txid });
-      return { ok: true, text, txid, quote: q, result: claim.body };
-    }
-    if (lastError instanceof StoreError && lastError.status >= 400 && lastError.status < 500) {
-      failed(`sent, but the Store refused the claim: ${lastError.message}`);
-      return {
-        ok: false,
-        text: `The payment for ${label} was sent, but the Store refused the claim (${lastError.code}). It is not released; email support@bwalletx.com with the txid.`,
-        txid,
-        quote: q,
-      };
-    }
-    const why = lastError instanceof Error ? ` (${lastError.message})` : '';
-    d.log(acct.name, { at: d.now(), action: 'buy', detail: `Pending, not bought yet: ${label} quote ${q.quote_id}${why}`, usd: q.usd, txid });
-    return {
-      ok: true,
-      pending: true,
-      text: `Pending, not bought yet: the payment for ${label} is sent, but the network hasn't shown it yet${why}. Don't pay again: the Store grants it once the network has it, even after the quote expires.`,
-      txid,
-      quote: q,
-      result: claim?.body,
+    // From the claim intent on, the signed payment has left this process: it stays counted against the cap.
+    let out = false;
+    let settled = false;
+    let txid: string | undefined;
+    const settle = (e: AgentLogEntry) => {
+      settled = true;
+      g.settle(e);
     };
+    try {
+      const r = await acct.wallet.createAction(args);
+      if (!r.txid || !r.tx) throw new Error('The wallet did not build the payment');
+      const id = r.txid;
+      txid = id;
+      const rawtx = Utils.toHex(r.tx);
+      const claimBody = async (intent: boolean) => ({
+        ...(await signRequest(acct.wallet, 'agent-buy-claim', { product: o.product, quote_id: q.quote_id, txid: id, ...(intent ? { intent: '1' } : {}) }, d.now())),
+        rawtx,
+      });
+      const failed = (detail: string, usd = 0) => settle({ at: d.now(), action: 'failed', detail: `Store buy ${o.product}: ${detail}`, usd, txid: id });
+
+      // 1. Intent: the Store checks the payment and records its txid. Nothing is posted, so a refusal releases it.
+      try {
+        await callStatus(d, 'buy', await claimBody(true));
+      } catch (e) {
+        await acct.wallet.abortAction({ reference: id }).catch(() => null);
+        failed(`not sent, released: ${e instanceof Error ? e.message : String(e)}`);
+        throw e;
+      }
+      out = true;
+
+      // 2. The account's own wallet broadcasts it (ancestors included) and its change becomes spendable.
+      const sent = await sendOwnPayment(acct.wallet, id);
+      if (sent === 'refused') {
+        failed('the network refused the payment');
+        return { ok: false, text: `Not bought: the network refused the payment for ${label}. Nothing was paid.`, txid: id, quote: q };
+      }
+
+      // 3. Claim. From here the payment is out: never released, whatever the answer.
+      let claim: { status: number; body: Record<string, unknown> } | undefined;
+      let lastError: unknown;
+      for (let i = 0; i <= PENDING_REPEATS_MS.length; i++) {
+        if (i > 0) await d.sleep(PENDING_REPEATS_MS[i - 1]);
+        try {
+          claim = await callStatus(d, 'buy', await claimBody(false));
+          lastError = undefined;
+          if (claim.status === 200) break;
+        } catch (e) {
+          lastError = e;
+          if (!(e instanceof StoreError && e.status === 502)) break;
+        }
+      }
+      if (claim?.status === 200) {
+        const text = `Bought ${label}`;
+        settle({ at: d.now(), action: 'buy', detail: `${text} quote ${q.quote_id}`, usd: q.usd, txid: id });
+        return { ok: true, text, txid: id, quote: q, result: claim.body };
+      }
+      if (lastError instanceof StoreError && lastError.status >= 400 && lastError.status < 500) {
+        failed(`sent, but the Store refused the claim: ${lastError.message} (counted against the cap)`, q.usd);
+        return {
+          ok: false,
+          text: `The payment for ${label} was sent, but the Store refused the claim (${lastError.code}). It is not released; email support@bwalletx.com with the txid.`,
+          txid: id,
+          quote: q,
+        };
+      }
+      const why = lastError instanceof Error ? ` (${lastError.message})` : '';
+      settle({ at: d.now(), action: 'buy', detail: `Pending, not bought yet: ${label} quote ${q.quote_id}${why}`, usd: q.usd, txid: id });
+      return {
+        ok: true,
+        pending: true,
+        text: `Pending, not bought yet: the payment for ${label} is sent, but the network hasn't shown it yet${why}. Don't pay again: the Store grants it once the network has it, even after the quote expires.`,
+        txid: id,
+        quote: q,
+        result: claim?.body,
+      };
+    } finally {
+      // Anything not settled above (a throw): counted if the payment may have left, else released.
+      if (settled) {
+        /* logged above */
+      } else if (out) settle({ at: d.now(), action: 'failed', detail: `Store buy ${o.product}: interrupted after sending (counted against the cap)`, usd: q.usd, ...(txid && { txid }) });
+      else g.release();
+    }
   } finally {
     await acct.close();
   }

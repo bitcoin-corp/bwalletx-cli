@@ -95,6 +95,8 @@ function setup(baskets: Baskets, over: Partial<SellDeps> = {}) {
   const calls = {
     gate: vi.fn((): { ok: true; paper: boolean } | { ok: false; reason: string } => ({ ok: true, paper: false })),
     log: vi.fn(),
+    settle: vi.fn(),
+    release: vi.fn(),
     sendWaiting: vi.fn(async () => undefined),
     close: vi.fn(async () => undefined),
   };
@@ -115,7 +117,21 @@ function setup(baskets: Baskets, over: Partial<SellDeps> = {}) {
     buyOrdinal: { execute: simple },
     buyBsv21: { execute: simple },
   };
+  const gate = over.gate ?? calls.gate;
   setSellDeps({
+    // The reservation answers as the gate does; a settle is the log entry.
+    reserve: async (n, a) => {
+      const g = gate(n, a);
+      if (!g.ok) return g;
+      return {
+        ...g,
+        settle: (e) => {
+          calls.settle(e);
+          calls.log(n, e);
+        },
+        release: calls.release,
+      };
+    },
     open: async () => ({ name: 'agent', ctx: { wallet: wallet as never, chain: 'main', isBaseWallet: true }, sendWaiting: calls.sendWaiting, close: calls.close }),
     unspent: async () => true,
     rate: async () => 50,
@@ -259,6 +275,24 @@ describe('buy-listing <outpoint>', () => {
     const t = setup({}, { fetchTx: async () => ordinalListing(), gate: () => ({ ok: false, reason: 'Over today' }) });
     expect((await buyListing({ outpoint: `${TXID}_0` })).text).toMatch(/Refused: Over today/);
     expect(t.actions.buyOrdinal.execute).not.toHaveBeenCalled();
+  });
+
+  test('two buys at once: only the one that fits under the cap signs', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { reserveSpend } = await import('./gate');
+    const { readLog, readReservations, writeConfig } = await import('./store');
+    process.env.BWALLETX_HOME = mkdtempSync(join(tmpdir(), 'bwx-sell-'));
+    // One ordinal listing costs 101,000 sats + fee at $50/BSV ≈ $0.05; the cap fits one.
+    writeConfig({ accounts: { agent: { name: 'agent', identityAddress: '1Id', payAddress: '1Pay', ordAddress: '1Ord', dailyCapUsd: 0.06, stopped: false, importedAt: 1 } }, defaultAccount: 'agent' });
+    const t = setup({}, { fetchTx: async () => ordinalListing(), reserve: (n, a) => reserveSpend(n, a) });
+    const out = await Promise.all([buyListing({ outpoint: `${TXID}_0` }), buyListing({ outpoint: `${TXID}_0` })]);
+    expect(out.filter((o) => o.ok)).toHaveLength(1);
+    expect(out.find((o) => !o.ok)?.text).toMatch(/Over today's cap/);
+    expect(t.actions.buyOrdinal.execute).toHaveBeenCalledTimes(1);
+    expect(readReservations('agent')).toEqual([]);
+    expect(readLog('agent').filter((e) => e.usd > 0)).toHaveLength(1);
   });
 });
 

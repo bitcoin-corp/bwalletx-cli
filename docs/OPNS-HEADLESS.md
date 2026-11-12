@@ -78,6 +78,11 @@ bwalletx opns sweep -a opns --to <your ordinals address> --to-pay <your BSV addr
 Cancels unsold listings, sends every name still in the agent account to `--to`, then sends the remaining sats to
 `--to-pay` (or `--to`). `--keep-listed` leaves listed names on sale; `--names-only` leaves the sats.
 
+Every name that leaves the account (`sweep`, `send`, `unlist`) goes through the gate as a send, valued at its listing
+tier: the kill switch, the daily cap, the approval threshold, the rate limit and a loaded strategy all apply, and the
+run stops at the first refusal. To move many names at once, raise the cap or rate limit for the run with the owner
+PIN (`bwalletx cap`, `bwalletx ratelimit`) and lower it again after.
+
 ## 5. Relist at the current tier prices
 
 Listings keep the price they were made at. After a tier change ($10 for 5+ characters, $50 for 4, $100 for 3,
