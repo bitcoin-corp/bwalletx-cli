@@ -47,12 +47,13 @@ program
   .command('login')
   .description('pair with bWalletX on your phone: keys stay on the phone (scan the QR from your agent account)')
   .option('-a, --account <name>', 'local name for this paired account', 'phone')
+  .option('--open-qr', 'also open the QR as an image (for terminals whose fonts break the text QR)')
   .action(
-    run(async (o: { account: string }) => {
+    run(async (o: { account: string; openQr?: boolean }) => {
       needTerminal();
       const owner = await og.requireOwner(`pair a phone account as "${o.account}"`);
       if (!asJson) await banner();
-      const p = await login(o.account, { confirmCode: askCode });
+      const p = await login(o.account, { confirmCode: askCode, openQr: o.openQr });
       og.approveNewAccount(owner, p.name);
       console.log(`\nPaired "${p.name}" with ${p.account}: ${p.scopes.join(', ')} until ${new Date(p.expiresAt).toLocaleDateString()}.`);
       console.log('Keep bWalletX open on that account while the CLI works. Try: bwalletx balance --account ' + p.name);

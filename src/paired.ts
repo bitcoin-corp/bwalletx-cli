@@ -13,6 +13,7 @@ import { brandQr, yellow } from './brand.js';
 import WebSocket from 'ws';
 import { existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 import {
   CLAIM_FORMAT,
   DEFAULT_RELAY,
@@ -73,6 +74,8 @@ export type LoginOptions = {
   confirmCode: (code: string) => Promise<boolean>;
   /** Relay host. Default relay.bwallet.space (tests use a local one). */
   relay?: string;
+  /** Also open the QR as an image (macOS Preview / the desktop's viewer), for terminals whose fonts break the text QR. */
+  openQr?: boolean;
 };
 export type MintInfo = { maxItems: number; maxUsd: number; itemsUsed: number; spentUsd: number; itemsLeft: number; usdLeft: number };
 
@@ -130,6 +133,19 @@ export function newChannelUrl(relay: string, c: string, sitePub: string, expiry:
   return relaySocketUrl(relay, c, 'site', expiry, sc, claimDigest(walletClaimFor(c, sitePub)));
 }
 
+/** The pairing QR as a PNG in the bwalletx home, opened in the system viewer. Best effort: the text QR and link stay. */
+async function showQrImage(link: string, out: (s: string) => void) {
+  try {
+    const file = join(home(), 'pair-qr.png');
+    await QRCode.toFile(file, link, { width: 560, margin: 4 });
+    const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer' : 'xdg-open';
+    spawn(opener, [file], { stdio: 'ignore', detached: true }).unref();
+    out(`QR image: ${file} (opened; scan that if the one above won't read)`);
+  } catch (e) {
+    out(`Couldn't open the QR image: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 /** `bwalletx login`: show a QR, wait for the phone, save the pairing as account `name`. */
 export async function login(name: string, opts: LoginOptions, out: (s: string) => void = console.log): Promise<Pairing> {
   if (!/^[A-Za-z0-9._-]{1,40}$/.test(name) || name.startsWith('.')) throw new Error(`Bad account name "${name}"`);
@@ -138,14 +154,14 @@ export async function login(name: string, opts: LoginOptions, out: (s: string) =
     throw new Error('login needs opts.confirmCode: ask whether the phone shows the same code');
   const deadline = Date.now() + 5 * 60_000;
   while (Date.now() < deadline) {
-    const r = await round(name, opts.mode ?? 'agent', out, opts.confirmCode, opts.relay ?? DEFAULT_RELAY);
+    const r = await round(name, opts.mode ?? 'agent', out, opts.confirmCode, opts.relay ?? DEFAULT_RELAY, opts.openQr);
     if (r) return r;
     out('\nThe code expired; here is a new one.\n');
   }
   throw new Error('Pairing timed out. Run `bwalletx login` again.');
 }
 
-function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void, confirmCode: LoginOptions['confirmCode'] | undefined, relay: string): Promise<Pairing | null> {
+function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void, confirmCode: LoginOptions['confirmCode'] | undefined, relay: string, openQr = false): Promise<Pairing | null> {
   const S = PrivateKey.fromRandom();
   const c = newChannel();
   const e = Math.floor(Date.now() / 1000) + QR_LIFETIME_S;
@@ -162,6 +178,7 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void,
     const timer = setTimeout(() => !sealer && (ws.close(), resolve(null)), QR_LIFETIME_S * 1000 - 5000);
     ws.on('open', async () => {
       out(brandQr(await QRCode.toString(link, { type: 'terminal', small: true })));
+      if (openQr) await showQrImage(link, out);
       out(
         yellow(
           mode === 'brc100'
