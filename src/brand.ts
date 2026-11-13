@@ -54,40 +54,27 @@ export async function banner(out: (s: string) => void = (s) => process.stdout.wr
 }
 
 /**
- * The pairing QR for a terminal, drawn from the modules themselves (owner, 13 Nov 2026: it must scan in the CLI).
- * Background colours fill a terminal cell's whole height, including the extra line spacing VS Code and others add;
- * half-block glyphs (▀▄) don't, which leaves stripes phones can't read. So each module is two background-coloured
- * spaces on its own row, pure black on pure white whatever the theme, in the roomiest layout that fits: a 2-module
- * white border and a title, then without the title, then a 1-module border (phones read that fine on a screen). When
- * none fits there is no QR at all, only how tall to make the window: a QR that can't scan is worse than none.
+ * The pairing QR for a terminal, small, the way qr-cli (github.com/asharahmed/qr-cli, render.ts renderSmall) and Expo
+ * draw it (owner, 13 Nov 2026): two module rows per text row with half-blocks, no colours. Dark modules are the
+ * terminal's text colour and light ones its background, so on a dark terminal the code is light-on-dark; phone
+ * scanners read that (bWalletX's scanner tries both ways since 5.2.56). A 2-module quiet zone.
  */
-export const terminalQr = (modules: { size: number; get(r: number, c: number): number | boolean }) => {
-  const BLK = '\x1b[48;2;0;0;0m';
-  const WHT = '\x1b[48;2;255;255;255m';
-  const RST = '\x1b[0m';
-  const rows = process.stdout.rows ?? 0;
-  const cols = process.stdout.columns ?? 0;
-  const title = ' bWalletX · scan to pair ';
-  for (const [quiet, withTitle] of [
-    [2, true],
-    [2, false],
-    [1, false],
-  ] as const) {
-    const n = modules.size + quiet * 2;
-    if (rows < n + (withTitle ? 1 : 0) || cols < n * 2) continue;
-    const dark = (r: number, c: number) =>
-      r >= quiet && c >= quiet && r < n - quiet && c < n - quiet && !!modules.get(r - quiet, c - quiet);
-    const lines: string[] = [];
-    for (let r = 0; r < n; r++) {
-      let l = '';
-      for (let c = 0; c < n; c++) l += (dark(r, c) ? BLK : WHT) + '  ';
-      lines.push(l + RST);
+export const terminalQr = (modules: { size: number; get(r: number, c: number): number | boolean }, border = 2) => {
+  const n = modules.size + border * 2;
+  const dark = (r: number, c: number) =>
+    r >= border && c >= border && r < n - border && c < n - border && !!modules.get(r - border, c - border);
+  const lines: string[] = [];
+  for (let r = 0; r < n; r += 2) {
+    let l = '';
+    for (let c = 0; c < n; c++) {
+      const top = dark(r, c);
+      const bottom = r + 1 < n && dark(r + 1, c);
+      l += top && bottom ? '█' : top ? '▀' : bottom ? '▄' : ' ';
     }
-    if (withTitle) lines.unshift(yellow(' '.repeat(Math.max(0, n - Math.floor(title.length / 2))) + title));
-    return lines.join('\n') + '\n';
+    lines.push(l);
   }
-  const need = modules.size + 2;
-  return yellow(`This window is too small for the pairing QR: make it at least ${need} rows tall and ${need * 2} wide and run again (or add --open-qr, or open the link below on the phone).`) + '\n';
+  const title = ' bWalletX · scan to pair ';
+  return [yellow(' '.repeat(Math.max(0, Math.floor((n - title.length) / 2))) + title), ...lines].join('\n') + '\n';
 };
 
 /** Colour a terminal QR (from qrcode's `small` renderer) yellow on the terminal background, framed with the brand. */
