@@ -55,15 +55,15 @@ export async function banner(out: (s: string) => void = (s) => process.stdout.wr
 
 /**
  * The pairing QR for a terminal (owner, 13 Nov 2026: it must scan in the CLI, and not be huge).
- * - `small` (the default): qr-cli / Expo style, two module rows per text row with half-blocks and no colours, so it
- *   is light-on-dark on a dark terminal (bWalletX's scanner tries both ways since 5.2.56).
+ * - `small` (the default): qr-cli / Expo style, two module rows per text row with half-blocks, but black on white
+ *   (explicit colours), never inverted: bWalletX's scanner reads dark-on-light only.
  * - `solid`: one module per character, black and white background colours. Half-blocks break where a terminal adds
  *   space between lines and draws block glyphs from the font (VS Code with GPU acceleration off centres each line,
  *   leaving a gap above and below that no scanner reads through); a cell's background fills that space. It is as
  *   tall as the code but only as wide, and phones read the tall modules fine. VS Code gets it by default.
  */
 export type QrStyle = 'small' | 'solid';
-export const defaultQrStyle = (): QrStyle => (process.env.TERM_PROGRAM === 'vscode' ? 'solid' : 'small');
+export const defaultQrStyle = (): QrStyle => 'small';
 export const terminalQr = (
   modules: { size: number; get(r: number, c: number): number | boolean },
   style: QrStyle = defaultQrStyle(),
@@ -80,14 +80,14 @@ export const terminalQr = (
       lines.push(l + '\x1b[0m');
     }
   } else {
+    // Dark on light, whatever the terminal theme: the top module is the ▀ glyph's colour, the bottom one the cell's
+    // background. Light-on-dark (no colours, as qr-cli draws it) is inverted, and bWalletX's scanner can't read that.
+    const FG = (d: boolean) => (d ? '\x1b[38;2;0;0;0m' : '\x1b[38;2;255;255;255m');
+    const BG = (d: boolean) => (d ? '\x1b[48;2;0;0;0m' : '\x1b[48;2;255;255;255m');
     for (let r = 0; r < n; r += 2) {
       let l = '';
-      for (let c = 0; c < n; c++) {
-        const top = dark(r, c);
-        const bottom = r + 1 < n && dark(r + 1, c);
-        l += top && bottom ? '█' : top ? '▀' : bottom ? '▄' : ' ';
-      }
-      lines.push(l);
+      for (let c = 0; c < n; c++) l += FG(dark(r, c)) + BG(r + 1 < n && dark(r + 1, c)) + '▀';
+      lines.push(l + '\x1b[0m');
     }
   }
   const title = ' bWalletX · scan to pair ';
