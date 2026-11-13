@@ -69,6 +69,26 @@ export function pairUrl(link: PairLink): string {
   return `https://${PAIR_HOST}/pair?${q}`;
 }
 
+/**
+ * The compact pairing code for the terminal QR (owner, 13 Nov 2026): `BWX1:<channel>:<key>`, RFC 4648 base32 without
+ * padding, so the QR is alphanumeric and 33 modules instead of 49. bWalletX (pair/protocol.ts expandCompactPair, 5.2.56+)
+ * implies the default relay, the CLI origin and the usual lifetime. Shared test vector with the wallet.
+ */
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+export const base32 = (bytes: Uint8Array) => {
+  let out = '';
+  let acc = 0;
+  let bits = 0;
+  for (const b of bytes) {
+    acc = ((acc << 8) | b) & 0xffff;
+    bits += 8;
+    while (bits >= 5) out += B32[(acc >>> (bits -= 5)) & 31];
+  }
+  return bits ? out + B32[(acc << (5 - bits)) & 31] : out;
+};
+export const compactPairCode = (channel: string, sitePubHex: string) =>
+  `BWX1:${base32(fromB64url(channel))}:${base32(Uint8Array.from(Buffer.from(sitePubHex, 'hex')))}`;
+
 /** Parse a scanned QR (https link or bwallet:// fallback). Throws on anything else. */
 export function parsePairUrl(text: string, nowS = Math.floor(Date.now() / 1000)): PairLink {
   const u = new URL(text.trim());

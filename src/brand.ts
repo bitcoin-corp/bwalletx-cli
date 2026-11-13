@@ -70,7 +70,7 @@ export const terminalQr = (modules: { size: number; get(r: number, c: number): n
   const rows = process.stdout.rows ?? 0;
   const cols = process.stdout.columns ?? 0;
   const title = ' bWalletX · scan to pair ';
-  if (rows >= n + 4 && cols >= n * 2) {
+  if (rows >= n + 1 && cols >= n * 2) {
     const lines: string[] = [];
     for (let r = 0; r < n; r++) {
       let l = '';
@@ -87,7 +87,7 @@ export const terminalQr = (modules: { size: number; get(r: number, c: number): n
     for (let c = 0; c < n; c++) l += FG(dark(r, c)) + (r + 1 < n && dark(r + 1, c) ? BLK : WHT) + '▀';
     lines.push(l + RST);
   }
-  const need = n + 4;
+  const need = n + 1;
   return (
     [yellow(' '.repeat(Math.max(0, Math.floor((n - title.length) / 2))) + title), ...lines].join('\n') +
     '\n' +
