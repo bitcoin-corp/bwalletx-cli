@@ -190,7 +190,7 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void,
         yellow(
           mode === 'brc100'
             ? 'In bWalletX: open your MAIN account, then Settings › Paired websites › Scan to connect (choose caps, sites and expiry)'
-            : 'In bWalletX: open the account to use (an AGENT account, or any account for minting only), then Settings › Paired websites › Scan to connect',
+            : 'In bWalletX: open the account to use (an AGENT account, or any account for minting only), then ☰ menu › Connect CLI & MCP › Scan',
         ),
       );
       out(`Or open this link on the phone:\n${link}\n`);
@@ -212,7 +212,7 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void,
           out(`Check your phone shows the code  ${code}  then choose what the CLI may do and tap Pair.`);
           return;
         }
-        out(`On your phone, choose what the CLI may do and tap Pair. The code is  ${code}`);
+        out(`The code is  ${code}`);
         const ask = confirmCode;
         answer = new Promise<boolean>((r) => r(ask(code))).catch(() => false);
         void answer.then(async (ok) => {
@@ -223,7 +223,7 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void,
           reject(new Error("The codes didn't match, so nothing was paired. Run the command again for a new code."));
         });
         if (!(await answer)) return;
-        out('Code confirmed.');
+        out('Code confirmed. Now tap Yes, pair on your phone (choose what the CLI may do first)…');
         return;
       }
       if (!sealer || !isSealed(f)) return;
