@@ -58,14 +58,15 @@ describe('CLI site sockets', () => {
     expect(u.searchParams.get('e')).toBe('123');
   });
 
-  it('a pairing saved before claims gets a site claim on its next connect, saved, and sends no wc', () => {
+  it('a pairing saved before claims gets a site claim on its next connect, saved, plus the QR-bound wc', () => {
     const saved: Pairing[] = [];
     const p = pairing();
     const u = new URL(pairedSiteUrl(p, 1, (x) => saved.push({ ...x })));
     expect(u.searchParams.get('claim')).toMatch(/^[A-Za-z0-9_-]{22,64}$/);
     expect(saved).toHaveLength(1);
     expect(saved[0].sc).toBe(u.searchParams.get('claim'));
-    expect(u.searchParams.get('wc')).toBeNull();
+    // A re-created channel is bound to the QR claim, so the channel ID alone isn't enough to take the phone's role.
+    expect(u.searchParams.get('wc')).toBe(claimDigest(QR_VECTOR));
     // The next connect reuses it.
     const again = new URL(pairedSiteUrl(p, 1, (x) => saved.push(x)));
     expect(again.searchParams.get('claim')).toBe(saved[0].sc);

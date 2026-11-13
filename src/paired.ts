@@ -95,15 +95,21 @@ const open = (url: string) => new WebSocket(url, { headers: { Origin: CLI_ORIGIN
 
 /**
  * The site socket URL for a saved pairing. Always carries our site claim (one is created and saved for pairings from
- * before claims), and for a v2 pairing the session claim digest, so a channel the relay re-creates admits only the
- * paired phone. Exported for tests.
+ * before claims), and a wallet binding: the session claim digest for a v2 pairing, the QR-bound claim's digest for a
+ * v1 one, so a channel the relay re-creates admits only the paired phone. Exported for tests.
  */
 export function pairedSiteUrl(p: Pairing, expiry: number, save: (p: Pairing) => void = savePairing): string {
   if (!p.sc || !CLAIM_FORMAT.test(p.sc)) {
     p.sc = newClaim();
     save(p);
   }
-  const wc = p.wv === 2 ? claimDigest(sessionWalletClaim(PrivateKey.fromHex(p.s), p.k, p.c)) : undefined;
+  // A v1 pairing sends the QR-bound claim's digest (review 13 Nov 2026): a channel the relay re-creates is then bound to
+  // it, so someone who knows only the channel ID can't take the phone's role; the phone rejoins with it and upgrades.
+  const key = PrivateKey.fromHex(p.s);
+  const wc =
+    p.wv === 2
+      ? claimDigest(sessionWalletClaim(key, p.k, p.c))
+      : claimDigest(walletClaimFor(p.c, key.toPublicKey().toString()));
   return relaySocketUrl(p.r, p.c, 'site', expiry, p.sc, wc);
 }
 
