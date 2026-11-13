@@ -11,7 +11,14 @@ A safety release. If you let an AI agent use bwalletx, upgrade.
   stays counted even if the process stops half way; one that didn't is released.
 - **OpNS name transfers go through the gate.** `opns sweep`, `opns send` and `opns unlist` treat each name as a send
   valued at its listing tier: the kill switch, daily cap, approval threshold, rate limit and strategy rules apply.
-  Moving many names may need the cap raised for the run (owner PIN).
+  Moving many names may need the cap raised for the run (owner PIN). A name whose name tag can't be read is valued
+  at the top tier ($500), never the cheapest.
+- **Listing below value counts against the cap.** `list` / MCP `list_for_sale` used to be a $0 action, so an agent
+  could list a $500 name for 1 sat and have someone else buy it. Now the shortfall (an OpNS name below its tier,
+  BSV-21 tokens below the market floor) is reserved against the daily cap and approval threshold like a send.
+  Ordinals have no known value and stay $0.
+- **An error after broadcast stays counted.** A buy, listing or name send whose builder answers with an error is
+  released only if the wallet was never asked to sign or send; otherwise it is counted as `failed`.
 - **`buy_product` no longer calls a pending payment "Bought".** The bWalletX Store now marks a purchase paid only
   once the network has the payment, and answers 202 until then. `buy_product` reports that as `pending: true`,
   "Pending, not bought yet", after asking again for about 30 s. A 409 `payment_pending` at quote time means a payment

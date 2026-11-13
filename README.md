@@ -149,7 +149,8 @@ find it the same way they find BSV Desktop. Built on `@bsv/wallet-toolbox`; keys
   `--budget-usd` (default $5).
 - **Tokens**: the caps value satoshis only, and a BSV-21 token output is 1 sat however much the token is
   worth. So a `createAction` with a BSV-20/21 inscribed output, or one that names the wallet's own outputs
-  as inputs, is refused unless serve runs with `--allow-token-transfers`.
+  as inputs, is refused unless serve runs with `--allow-token-transfers`. With that flag the caps still count the
+  sats, but not what the tokens or ordinals are worth (see "Not covered by the USD cap" below).
 - Paired accounts can't serve: their keys stay on the phone.
 
 ## Default limits
@@ -221,6 +222,17 @@ Every spending action, from the CLI, `agent run` or MCP, passes the same checks 
 7. **Paper mode** fills on the paper book and never signs
 
 Every refusal is logged with the rule that refused it.
+
+Items that leave the account are valued in dollars where bwalletx knows a value: an OpNS name at its listing tier
+(the top tier, $500, when its name can't be read), and a listing below value counts the shortfall (OpNS tier, or
+the BSV-21 market floor). A spend whose builder fails is released only if the wallet was never asked to sign or send.
+
+### Not covered by the USD cap
+
+- `serve --allow-token-transfers`: sites may move BSV-21 tokens and ordinals; only their sats count.
+- `opns mint --to <address>`: vault and gift names are locked straight to that address as they are mined; only the
+  mint fees count (against `--budget`), not the names' value.
+- `list` for an ordinal: it has no known value, so it is a $0 list however low the price.
 
 ## Strategies
 

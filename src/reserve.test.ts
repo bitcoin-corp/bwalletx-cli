@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, test } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { gateAction, reserveSpend } from './gate';
+import { gateAction, reserveSpend, watchBroadcast } from './gate';
 import { addReservation, readLog, readReservations, setAllStopped, writeConfig, type AccountConfig } from './store';
 
 const acct = (p: Partial<AccountConfig> = {}): AccountConfig => ({
@@ -97,5 +97,62 @@ describe('OpNS name transfers go through the same gate', () => {
     b.sending();
     b.end();
     expect(readLog('t')).toContainEqual(expect.objectContaining({ action: 'failed', usd: 10 }));
+  });
+});
+
+describe('an error after broadcast stays counted (review fix)', () => {
+  beforeEach(() => {
+    process.env.BWALLETX_HOME = mkdtempSync(join(tmpdir(), 'bwx-bc-'));
+    writeConfig({ accounts: { t: acct({ dailyCapUsd: 25 }) }, defaultAccount: 't' });
+  });
+
+  test('nameMove: a send that failed after it may have gone out is counted; one that never reached the signer is released', async () => {
+    const { nameMove } = await import('./opns/headless');
+    const b = await nameMove('t', 'bobby', '1Owner');
+    if ('refused' in b) throw new Error(b.refused);
+    b.sending();
+    b.failed(false);
+    b.end();
+    expect(readReservations('t')).toEqual([]);
+    expect(readLog('t').filter((e) => e.usd > 0)).toEqual([]);
+    const a = await nameMove('t', 'alice', '1Owner');
+    if ('refused' in a) throw new Error(a.refused);
+    a.sending();
+    a.failed(true);
+    a.end();
+    expect(readReservations('t')).toEqual([]);
+    expect(readLog('t')).toContainEqual(expect.objectContaining({ action: 'failed', usd: 10 }));
+  });
+
+  test('nameMove values an unreadable name at the price it is given (the sweep passes the top tier)', async () => {
+    const { nameMove } = await import('./opns/headless');
+    const { TOP_TIER_USD } = await import('./opns/batch');
+    // The $10 tier its outpoint would have got fits today's cap; the top tier does not.
+    expect(await nameMove('t', `${'d'.repeat(64)}.0`, '1Owner', TOP_TIER_USD)).toEqual({ refused: expect.stringMatching(/Over today's cap/) });
+  });
+
+  test('watchBroadcast: only a deferred createAction that threw or left a signable tx is "not sent"', async () => {
+    const fail = async () => {
+      throw new Error('nope');
+    };
+    const w1 = watchBroadcast({ createAction: fail });
+    await expect(w1.wallet.createAction({ options: { signAndProcess: false } })).rejects.toThrow('nope');
+    expect(w1.mayHaveBroadcast()).toBe(false);
+
+    const w2 = watchBroadcast({ createAction: async () => ({ signableTransaction: { reference: 'r' } }), signAction: fail });
+    await w2.wallet.createAction({ options: { signAndProcess: false } });
+    expect(w2.mayHaveBroadcast()).toBe(false);
+    await expect(w2.wallet.signAction()).rejects.toThrow('nope');
+    expect(w2.mayHaveBroadcast()).toBe(true);
+
+    const w3 = watchBroadcast({ createAction: fail });
+    await expect(w3.wallet.createAction({})).rejects.toThrow('nope'); // signs and processes by default
+    expect(w3.mayHaveBroadcast()).toBe(true);
+
+    const w4 = watchBroadcast({ createAction: async () => ({ txid: 'aa' }), listOutputs: async () => 1 });
+    expect(await w4.wallet.listOutputs()).toBe(1);
+    expect(w4.mayHaveBroadcast()).toBe(false);
+    await w4.wallet.createAction({ options: { signAndProcess: false } });
+    expect(w4.mayHaveBroadcast()).toBe(true);
   });
 });

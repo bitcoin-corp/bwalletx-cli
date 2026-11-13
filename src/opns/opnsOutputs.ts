@@ -4,7 +4,7 @@
  * its resumable progress file. Wired up in headless.ts.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
-import { tierUsd, usdToSats } from './batch.js';
+import { TOP_TIER_USD, tierUsd, usdToSats } from './batch.js';
 
 export type OpnsOutput = { outpoint: string; tags?: string[]; customInstructions?: string };
 export type OpnsPage<T extends OpnsOutput = OpnsOutput> = { outputs: T[]; totalOutputs?: number };
@@ -43,6 +43,11 @@ export const nameOfOutput = (o: OpnsOutput): string => {
   } catch {
     return '';
   }
+};
+/** What a name output is worth when it leaves the wallet: its listing tier, or the top tier when its name can't be read. */
+export const nameValueUsd = (o: OpnsOutput): number => {
+  const n = nameOfOutput(o);
+  return n ? tierUsd(n) : TOP_TIER_USD;
 };
 export const fromTxid = (o: OpnsOutput, txid: string) => o.outpoint.startsWith(`${txid}.`) || o.outpoint.startsWith(`${txid}_`);
 

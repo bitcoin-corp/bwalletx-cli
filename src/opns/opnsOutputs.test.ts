@@ -8,6 +8,7 @@ import {
   listAllPaged,
   loadRelistProgress,
   nameOfOutput,
+  nameValueUsd,
   planRelist,
   remaining,
   saveRelistProgress,
@@ -46,6 +47,14 @@ describe('names on outputs', () => {
     expect(nameOfOutput(back)).toBe('paris');
     expect(unlistedIdFor([listed('paris', 5), back], 'paris')).toBe(back.outpoint);
     expect(unlistedIdFor([listed('paris', 5)], 'paris')).toBeUndefined();
+  });
+
+  test('value leaving the wallet: the tier, or the top tier when the name cannot be read (fail closed)', () => {
+    expect(nameValueUsd({ outpoint: 'a.0', tags: ['name:alice'] })).toBe(10);
+    expect(nameValueUsd({ outpoint: 'a.0', customInstructions: JSON.stringify({ name: 'ab' }) })).toBe(500);
+    // A name output without its name tag used to be valued by its outpoint (66 chars: the $10 tier).
+    expect(nameValueUsd({ outpoint: `${'d'.repeat(64)}.0`, tags: ['opns', 'id:x'] })).toBe(500);
+    expect(nameValueUsd({ outpoint: `${'d'.repeat(64)}.0`, customInstructions: 'not json' })).toBe(500);
   });
 });
 

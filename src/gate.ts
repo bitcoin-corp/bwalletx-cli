@@ -192,3 +192,38 @@ export const reserveSpend = (name: string, action: ActionRequest, extra: GateInp
       },
     };
   });
+
+type WalletLike = object;
+
+/**
+ * Wrap a wallet to tell, after a builder answered with an error, whether anything may have gone out. It "may have
+ * broadcast" once the wallet was asked to sign or process: `signAction`, `internalizeAction`, or a `createAction`
+ * that signs and processes (the default) or returned a txid. The only `createAction` that can't have sent anything is
+ * one made with `signAndProcess: false` that threw or handed back a signable transaction. Callers release a
+ * reservation only when this says false; otherwise the spend stays counted (fail closed).
+ */
+export function watchBroadcast<W extends WalletLike>(w: W): { wallet: W; mayHaveBroadcast: () => boolean } {
+  let may = false;
+  const wallet = new Proxy(w, {
+    get(t, p, r) {
+      const v = Reflect.get(t, p, r) as unknown;
+      if (typeof v !== 'function') return v;
+      const fn = (v as (...a: unknown[]) => unknown).bind(t);
+      if (p === 'signAction' || p === 'internalizeAction')
+        return (...a: unknown[]) => {
+          may = true;
+          return fn(...a);
+        };
+      if (p === 'createAction')
+        return async (args: { options?: { signAndProcess?: boolean } }, ...rest: unknown[]) => {
+          const deferred = args?.options?.signAndProcess === false;
+          if (!deferred) may = true;
+          const res = (await fn(args, ...rest)) as { txid?: string; signableTransaction?: unknown } | undefined;
+          if (res?.txid || !res?.signableTransaction) may = true;
+          return res;
+        };
+      return fn;
+    },
+  });
+  return { wallet: wallet as W, mayHaveBroadcast: () => may };
+}

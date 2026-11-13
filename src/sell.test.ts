@@ -136,6 +136,7 @@ function setup(baskets: Baskets, over: Partial<SellDeps> = {}) {
     unspent: async () => true,
     rate: async () => 50,
     overlayFee: async () => ({ address: addr(), sats: 1000 }),
+    tokenFloorUsd: async () => null,
     gate: calls.gate,
     stopped: () => false,
     log: calls.log,
@@ -202,6 +203,105 @@ describe('list', () => {
     expect((await listForSale({ outpoint: `${TXID}_0`, priceSats: 1 })).text).toMatch(/already listed/);
     setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] });
     await expect(listForSale({ outpoint: `${TXID}_1`, priceSats: 1, amount: '51', dryRun: true })).rejects.toThrow(/holds 50 TEST/);
+  });
+});
+
+describe('list below value: the shortfall counts against the cap (review fix)', () => {
+  // $50/BSV in the rig: 1 sat ≈ $0.0000005.
+  const opnsOut = (name: string | null) => out(`${TXID}.2`, ['id:n1', ...(name ? [`name:${name}`] : [])]);
+
+  test('an OpNS name listed for 1 sat is reserved at its tier, not as a $0 list', async () => {
+    const t = setup({ [OPNS_BASKET]: [opnsOut('abc')] }); // 3 characters: $100
+    const r = await listForSale({ outpoint: `${TXID}_2`, priceSats: 1 });
+    expect(r.ok).toBe(true);
+    expect(t.calls.gate).toHaveBeenCalledWith('agent', expect.objectContaining({ kind: 'list', token: 'opns', usd: expect.closeTo(100, 4) }));
+    expect(t.calls.settle).toHaveBeenCalledWith(expect.objectContaining({ action: 'list', usd: expect.closeTo(100, 4) }));
+  });
+
+  test('at or above its tier: $0; a name output with no readable name is valued at the top tier', async () => {
+    const t = setup({ [OPNS_BASKET]: [opnsOut('abc')] });
+    await listForSale({ outpoint: `${TXID}_2`, priceSats: 200_000_000 }); // 2 BSV = $100
+    expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ usd: 0 }));
+    const u = setup({ [OPNS_BASKET]: [opnsOut(null)] });
+    await listForSale({ outpoint: `${TXID}_2`, priceSats: 1 });
+    expect(u.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ usd: expect.closeTo(500, 4) }));
+  });
+
+  test('no BSV price: the whole tier counts (fail closed)', async () => {
+    const t = setup({ [OPNS_BASKET]: [opnsOut('alice')] }, { rate: async () => Promise.reject(new Error('down')) });
+    await listForSale({ outpoint: `${TXID}_2`, priceSats: 100_000_000 });
+    expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ usd: 10 }));
+  });
+
+  test('against the real gate: a $100 name for 1 sat is refused over a $15 cap and nothing is signed', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { reserveSpend } = await import('./gate');
+    const { readReservations, writeConfig } = await import('./store');
+    process.env.BWALLETX_HOME = mkdtempSync(join(tmpdir(), 'bwx-list-'));
+    writeConfig({ accounts: { agent: { name: 'agent', identityAddress: '1Id', payAddress: '1Pay', ordAddress: '1Ord', dailyCapUsd: 15, stopped: false, importedAt: 1 } }, defaultAccount: 'agent' });
+    const t = setup({ [OPNS_BASKET]: [opnsOut('abc')] }, { reserve: (n, a) => reserveSpend(n, a) });
+    const r = await listForSale({ outpoint: `${TXID}_2`, priceSats: 1 });
+    expect(r).toMatchObject({ ok: false, text: expect.stringMatching(/Over today's cap/) });
+    expect(t.actions.sellOpns.execute).not.toHaveBeenCalled();
+    expect(readReservations('agent')).toEqual([]);
+  });
+
+  test('BSV-21 below the market floor counts the shortfall; an unreadable floor refuses', async () => {
+    // 5000 raw at 2 decimals = 50 TEST; floor $0.01/token = $0.50.
+    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenFloorUsd: async () => 0.01 });
+    await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 });
+    expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ kind: 'list', token: TOKEN, usd: expect.closeTo(0.5, 4) }));
+    const u = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenFloorUsd: async () => Promise.reject(new Error('GorillaPool down')) });
+    expect((await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 })).text).toMatch(/Refused: couldn't read the market floor/);
+    expect(u.actions.sendBsv21.execute).not.toHaveBeenCalled();
+  });
+
+  test('ordinals have no known value: still a $0 list (documented gap)', async () => {
+    const t = setup({ [ORDINALS_BASKET]: [out(`${TXID}.0`, ['id:o1'])] });
+    await listForSale({ outpoint: `${TXID}_0`, priceSats: 1 });
+    expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ kind: 'list', token: 'ordinal', usd: 0 }));
+  });
+});
+
+describe('an error answer after the wallet signed stays counted (review fix)', () => {
+  const ordinalListing = () => {
+    const tx = new Transaction();
+    tx.addOutput({ lockingScript: OrdLockV2.lock(addr(), addr(), 100_000), satoshis: 1 });
+    return tx;
+  };
+  /** Reaches the wallet (createAction signs and processes), then answers with an error and no txid. */
+  const lateError = vi.fn(async (ctx: { wallet: { createAction: (a: CreateActionArgs) => Promise<unknown> } }) => {
+    await ctx.wallet.createAction({ description: 'buy', outputs: [] });
+    return { error: 'processAction failed after broadcast' };
+  });
+  /** Answers with an error before touching the wallet. */
+  const earlyError = vi.fn(async () => ({ error: 'no funding' }));
+
+  test('buy-listing: counted when the wallet was asked to sign; released when it never was', async () => {
+    const t = setup({}, { fetchTx: async () => ordinalListing() });
+    t.actions.buyOrdinal.execute = lateError as never;
+    await expect(buyListing({ outpoint: `${TXID}_0` })).rejects.toThrow(/Purchase failed/);
+    expect(t.calls.settle).toHaveBeenCalledWith(expect.objectContaining({ action: 'failed', usd: expect.any(Number) }));
+    expect(t.calls.release).not.toHaveBeenCalled();
+    const u = setup({}, { fetchTx: async () => ordinalListing() });
+    u.actions.buyOrdinal.execute = earlyError as never;
+    await expect(buyListing({ outpoint: `${TXID}_0` })).rejects.toThrow(/Purchase failed/);
+    expect(u.calls.release).toHaveBeenCalledOnce();
+    expect(u.calls.settle).not.toHaveBeenCalled();
+  });
+
+  test('list: same rule', async () => {
+    const t = setup({ [OPNS_BASKET]: [out(`${TXID}.2`, ['id:n1', 'name:abc'])] });
+    t.actions.sellOpns.execute = lateError as never;
+    await expect(listForSale({ outpoint: `${TXID}_2`, priceSats: 1 })).rejects.toThrow(/Listing failed/);
+    expect(t.calls.settle).toHaveBeenCalledWith(expect.objectContaining({ action: 'failed', usd: expect.closeTo(100, 4) }));
+    expect(t.calls.release).not.toHaveBeenCalled();
+    const u = setup({ [OPNS_BASKET]: [out(`${TXID}.2`, ['id:n1', 'name:abc'])] });
+    u.actions.sellOpns.execute = earlyError as never;
+    await expect(listForSale({ outpoint: `${TXID}_2`, priceSats: 1 })).rejects.toThrow(/Listing failed/);
+    expect(u.calls.release).toHaveBeenCalledOnce();
   });
 });
 

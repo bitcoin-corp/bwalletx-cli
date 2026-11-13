@@ -39,8 +39,9 @@ import {
 } from '@1sat/actions';
 import { LockingScript, P2PKH, PublicKey, Transaction, type CreateActionArgs, type CreateActionOutput, type Script, type WalletInterface, type WalletOutput } from '@bsv/sdk';
 import { MARKET_FEE_ADDRESS, MARKET_FEE_RATE, marketFeeSats } from './buy.js';
-import { gateAction, reserveSpend, type Reserved } from './gate.js';
-import { bsvUsd, outpointUnspent, overlayFee } from './market.js';
+import { gateAction, reserveSpend, watchBroadcast, type Reserved } from './gate.js';
+import { bsvUsd, outpointUnspent, overlayFee, tokenPrice } from './market.js';
+import { nameValueUsd } from './opns/opnsOutputs.js';
 import { allStopped, appendLog, home, readJsonFile, writeJsonFile } from './store.js';
 import { rawTx } from './wallet.js';
 import type { AgentLogEntry, ActionRequest } from './strategy.js';
@@ -149,6 +150,8 @@ export type SellDeps = {
   unspent: (outpoint: string) => Promise<boolean>;
   rate: () => Promise<number>;
   overlayFee: (tokenId: string) => Promise<{ address: string; sats: number } | null>;
+  /** BSV-21 market floor in USD per whole token (cheapest live listing), null when nothing is listed. */
+  tokenFloorUsd: (tokenId: string) => Promise<number | null>;
   gate: (name: string, a: ActionRequest) => { ok: true; paper: boolean } | { ok: false; reason: string };
   /** Buys: gate + reserve the dollars before signing (gate.ts reserveSpend); settled or released after. */
   reserve: (name: string, a: ActionRequest) => Promise<Reserved>;
@@ -243,6 +246,7 @@ const defaultDeps = (): SellDeps => ({
   unspent: outpointUnspent,
   rate: bsvUsd,
   overlayFee,
+  tokenFloorUsd: async (id) => (await tokenPrice(id)).floorUsdPerToken,
   gate: (name, a) => gateAction(name, a),
   reserve: (name, a) => reserveSpend(name, a),
   stopped: allStopped,
@@ -273,9 +277,17 @@ export type SellResult = { ok: boolean; text: string; dryRun?: boolean; txid?: s
 type Confirm = (q: string) => Promise<boolean>;
 const fmtUsd = (n: number) => (n >= 0.01 ? `$${n.toFixed(2)}` : `$${n.toPrecision(3)}`);
 
-/** Run an action for real, or (dry run) against the recording wallet and return what it built. */
-async function runAction<I>(acct: SellAccount, exec: Exec<I>, input: I, dryRun: boolean): Promise<{ res: Res; built?: BuiltTx }> {
-  if (!dryRun) return { res: await exec.execute(acct.ctx, input) };
+/**
+ * Run an action for real, or (dry run) against the recording wallet and return what it built. A real run says whether
+ * anything may have been broadcast (gate.ts watchBroadcast), so an error answer only releases a reservation when
+ * nothing can have gone out.
+ */
+async function runAction<I>(acct: SellAccount, exec: Exec<I>, input: I, dryRun: boolean): Promise<{ res: Res; built?: BuiltTx; mayHaveBroadcast?: boolean }> {
+  if (!dryRun) {
+    const watch = watchBroadcast(acct.ctx.wallet);
+    const res = await exec.execute({ ...acct.ctx, wallet: watch.wallet }, input);
+    return { res, mayHaveBroadcast: !!res.txid || watch.mayHaveBroadcast() };
+  }
   const dry = dryRunWallet(acct.ctx.wallet);
   const res = await exec.execute({ ...acct.ctx, wallet: dry.wallet }, input).catch((e: unknown) => ({ error: e instanceof Error ? e.message : String(e) }));
   const args = dry.captured[0];
@@ -337,8 +349,9 @@ export async function listForSale(o: ListOpts): Promise<SellResult> {
     const priceText = `${o.priceSats.toLocaleString()} sats${rate ? ` (≈ ${fmtUsd((o.priceSats / 1e8) * rate)})` : ''}`;
 
     let what: string;
-    let run: () => Promise<{ res: Res; built?: BuiltTx }>;
+    let run: () => Promise<{ res: Res; built?: BuiltTx; mayHaveBroadcast?: boolean }>;
     let record: Omit<TokenRecord, 'outpoint' | 'createdAt'> | null = null;
+    let tokens = 0; // BSV-21: whole tokens listed
     if (own.kind === 'token') {
       const t = own.token;
       const raw = o.amount ? toRaw(o.amount, t.dec) : t.amt;
@@ -352,6 +365,7 @@ export async function listForSale(o: ListOpts): Promise<SellResult> {
       const back = decodeAnyListing(script);
       if (!back?.token || back.token.id !== t.id || back.token.amount !== raw || back.priceSats !== o.priceSats) throw new Error('Listing script failed its round-trip check');
       what = `${fromRaw(raw, t.dec)} ${t.sym ?? t.id}`;
+      tokens = Number(fromRaw(raw, t.dec));
       record = { tokenId: t.id, amount: raw.toString(), priceSats: o.priceSats, keyID, ...(t.sym && { sym: t.sym }), dec: t.dec };
       run = () => runAction(acct, d.actions.sendBsv21, { tokenId: t.id, recipients: [{ amount: raw.toString(), destination: { lockingScript: script.toHex() } }] }, !!o.dryRun);
     } else {
@@ -364,21 +378,52 @@ export async function listForSale(o: ListOpts): Promise<SellResult> {
       const { built } = await run();
       return { ok: true, dryRun: true, built, text: `Dry run: list ${what} for ${priceText} from ${acct.name}. Built a ${built!.inputs}-input, ${built!.outputs.length}-output listing (OrdLock v2); nothing signed, nothing broadcast.` };
     }
-    const refused = refuseSpend(d, acct.name, { kind: 'list', token: own.token?.id ?? (own.kind === 'opns' ? 'opns' : 'ordinal'), ...(own.token?.sym && { ticker: own.token.sym }), usd: 0 });
-    if (refused) return { ok: false, text: refused };
-    if (o.confirm && !(await o.confirm(`List ${what} for ${priceText} from ${acct.name}? Anyone can buy it at that price until you unlist it.`))) return { ok: false, text: 'Not confirmed (pass --yes to skip)' };
-    const { res } = await run();
-    const txid = txidFromResult(res, 'Listing');
-    await acct.sendWaiting();
-    let outpoint = `${txid}_0`;
-    if (record) {
-      const vout = res.tx ? listingVout(res.tx, record.tokenId) : 0;
-      outpoint = `${txid}_${vout}`;
-      d.records.save(acct.name, [{ ...record, outpoint, createdAt: Date.now() }, ...d.records.load(acct.name).filter((r) => !sameOutpoint(r.outpoint, outpoint))]);
+
+    // A listing below what the item is worth gives the difference away to whoever buys it (an accomplice can buy a
+    // $500 name listed at 1 sat). So the shortfall is gated and reserved against the daily cap, approval threshold and
+    // strategy limits like a send: OpNS names at their listing tier (the top tier when the name can't be read), BSV-21
+    // tokens at the market floor. A missing BSV price counts the whole value (fail closed). Ordinals have no known
+    // value here, so they are gated at $0 (README: what the USD cap does not cover).
+    let valueUsd = 0;
+    if (own.kind === 'opns') valueUsd = nameValueUsd(own.output);
+    else if (own.kind === 'token') {
+      let floor: number | null;
+      try {
+        floor = await d.tokenFloorUsd(own.token.id);
+      } catch (e) {
+        return { ok: false, text: `Refused: couldn't read the market floor to value this listing (${e instanceof Error ? e.message : String(e)}); try again` };
+      }
+      valueUsd = floor != null && floor > 0 ? floor * tokens : 0;
     }
-    const text = `Listed ${what} for ${priceText}: ${outpoint}`;
-    d.log(acct.name, { at: Date.now(), action: 'list', detail: text, usd: 0, txid });
-    return { ok: true, text, txid, outpoint };
+    const priceUsd = (o.priceSats / 1e8) * rate;
+    const shortUsd = Math.max(0, valueUsd - priceUsd);
+    const g = await d.reserve(acct.name, { kind: 'list', token: own.token?.id ?? (own.kind === 'opns' ? 'opns' : 'ordinal'), ...(own.token?.sym && { ticker: own.token.sym }), usd: shortUsd });
+    if (!g.ok) return { ok: false, text: `Refused: ${g.reason}` };
+    if (g.paper) return { ok: false, text: 'Paper mode: nothing is signed (load the strategy --live, or unload it)' };
+    const below = shortUsd > 0 ? ` That is ${fmtUsd(shortUsd)} below its ${fmtUsd(valueUsd)} value, and the difference counts against today's cap.` : '';
+    let state: 'idle' | 'signing' | 'done' = 'idle';
+    try {
+      if (o.confirm && !(await o.confirm(`List ${what} for ${priceText} from ${acct.name}? Anyone can buy it at that price until you unlist it.${below}`))) return { ok: false, text: 'Not confirmed (pass --yes to skip)' };
+      state = 'signing';
+      const { res, mayHaveBroadcast } = await run();
+      if ((res.error || !res.txid) && !mayHaveBroadcast) state = 'idle'; // nothing reached the wallet's signer: released
+      const txid = txidFromResult(res, 'Listing');
+      state = 'done';
+      let outpoint = `${txid}_0`;
+      if (record) {
+        const vout = res.tx ? listingVout(res.tx, record.tokenId) : 0;
+        outpoint = `${txid}_${vout}`;
+      }
+      const text = `Listed ${what} for ${priceText}: ${outpoint}`;
+      g.settle({ at: Date.now(), action: 'list', detail: `${text}${shortUsd > 0 ? ` (${fmtUsd(shortUsd)} below its value)` : ''}`, usd: shortUsd, txid });
+      await acct.sendWaiting();
+      if (record) d.records.save(acct.name, [{ ...record, outpoint, createdAt: Date.now() }, ...d.records.load(acct.name).filter((r) => !sameOutpoint(r.outpoint, outpoint))]);
+      return { ok: true, text, txid, outpoint };
+    } finally {
+      // A throw while signing/broadcasting may still have listed it: counted. Nothing reached the signer: released.
+      if (state === 'signing') g.settle({ at: Date.now(), action: 'failed', detail: `List ${what} interrupted (may have been broadcast: counted against the cap)`, usd: shortUsd });
+      else if (state === 'idle') g.release();
+    }
   } finally {
     await acct.close();
   }
@@ -542,8 +587,10 @@ export async function buyListing(o: BuyListingOpts): Promise<SellResult> {
       if (o.confirm && !(await o.confirm(`Buy ${what} for ≈ ${fmtUsd(usd)} (${breakdown}) from ${acct.name}?`))) return { ok: false, text: 'Not confirmed (pass --yes to skip)' };
       if (!(await d.unspent(op.us))) return { ok: false, text: `${op.us} was just bought or cancelled` };
       state = 'signing';
-      const { res } = await run(false);
-      if (res.error || !res.txid) state = 'idle'; // the builder answered with an error: nothing was broadcast
+      const { res, mayHaveBroadcast } = await run(false);
+      // The builder answered with an error before the wallet signed or sent anything: released. An error after the
+      // wallet was asked to sign/process (or with a txid) may have been broadcast: stays counted.
+      if ((res.error || !res.txid) && !mayHaveBroadcast) state = 'idle';
       const txid = txidFromResult(res, 'Purchase');
       await acct.sendWaiting();
       const text = `Bought ${what} for ≈ ${fmtUsd(usd)} (${sats} sats + network fee)`;

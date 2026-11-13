@@ -81,7 +81,11 @@ Cancels unsold listings, sends every name still in the agent account to `--to`, 
 Every name that leaves the account (`sweep`, `send`, `unlist`) goes through the gate as a send, valued at its listing
 tier: the kill switch, the daily cap, the approval threshold, the rate limit and a loaded strategy all apply, and the
 run stops at the first refusal. To move many names at once, raise the cap or rate limit for the run with the owner
-PIN (`bwalletx cap`, `bwalletx ratelimit`) and lower it again after.
+PIN (`bwalletx cap`, `bwalletx ratelimit`) and lower it again after. An output whose name can't be read is valued
+at the top tier ($500). Listing a name with `bwalletx list` below its tier counts the difference against the cap.
+
+Not covered by the cap: names minted with `opns mint --to <address>` (`--vault` / `--gift` names) are locked
+straight to that address as they are mined. Only the mint fees count against `--budget`; the names' value doesn't.
 
 ## 5. Relist at the current tier prices
 
