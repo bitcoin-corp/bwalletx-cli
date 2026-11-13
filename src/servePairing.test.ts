@@ -9,7 +9,7 @@ import type { AddressInfo } from 'node:net';
 const dir = mkdtempSync(join(tmpdir(), 'bwx-pair-'));
 process.env.BWALLETX_HOME = dir;
 
-const { serve } = await import('./brc100.js');
+const { serve, SERVE_VERSION } = await import('./brc100.js');
 const { revokePairing, listPairings } = await import('./servePairing.js');
 
 const SITE = 'https://www.tokenblaster.lol';
@@ -47,7 +47,7 @@ describe('serve pairing', () => {
   });
 
   it('getVersion and isAuthenticated answer unpaired but leak nothing', async () => {
-    expect(JSON.parse((await post('/getVersion', { origin: SITE })).body)).toEqual({ version: 'bwalletx-1.0.0' });
+    expect(JSON.parse((await post('/getVersion', { origin: SITE })).body)).toEqual({ version: SERVE_VERSION });
     expect(JSON.parse((await post('/isAuthenticated', { origin: SITE })).body)).toEqual({ authenticated: false });
     expect(calls).toEqual([]);
   });

@@ -131,6 +131,14 @@ describe('serve --wallet paired', () => {
     expect(arcCalls).toEqual([]);
   });
 
+  it('answers getVersion itself (the serve version), without asking the phone', async () => {
+    const { post, fake } = await setup('answer');
+    const r = await post('getVersion', {});
+    expect(r.status).toBe(200);
+    expect(String(r.body.version)).toMatch(/^bwalletx-serve-\d+\.\d+\.\d+$/);
+    expect(fake.seen).toEqual([]);
+  });
+
   it('refuses disallowed origins locally', async () => {
     const { post, fake } = await setup('answer');
     const r = await post('getPublicKey', { identityKey: true }, 'https://evil.example');

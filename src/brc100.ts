@@ -12,7 +12,7 @@
  *   - every call that spends or signs is logged to ~/.bwalletx/log/<account>.jsonl.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import type { CreateActionArgs, WalletInterface } from '@bsv/sdk';
@@ -293,6 +293,37 @@ export async function relayToArc(result: unknown, url = 'https://arc.gorillapool
   await fetch(`${url}/v1/tx`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rawTx }), signal: AbortSignal.timeout(15_000) });
 }
 
+type SendWithResult = { txid?: unknown; status?: unknown };
+type ActionResult = { txid?: string; tx?: number[]; sendWithResults?: SendWithResult[]; signableTransaction?: { reference?: string } };
+
+/**
+ * Which txids serve may hand to ARC after a createAction/signAction, given what the wallet did.
+ *
+ * Only what the wallet itself shared with the network: the toolbox lists exactly those in sendWithResults (the new
+ * tx unless it was built noSend, plus every txid named in options.sendWith), with status 'failed' for any it
+ * refused. A noSend build is never relayed itself, whatever the result says: the app asked for it to be held
+ * (build → check → sendWith, or abortAction), and broadcasting it anyway pays twice and breaks the wallet's
+ * records (13 Nov 2026 review). A result without sendWithResults (not the toolbox) relays its own tx only when
+ * it wasn't noSend. Parents first: the new tx goes last, after the sendWith txids it may spend.
+ */
+export function txidsToRelay(out: unknown, o: { noSend: boolean }): string[] {
+  const r = (out ?? {}) as ActionResult;
+  const subject = typeof r.txid === 'string' ? r.txid : undefined;
+  let ids: string[];
+  if (Array.isArray(r.sendWithResults)) {
+    ids = r.sendWithResults.filter((x) => typeof x?.txid === 'string' && x.status !== 'failed').map((x) => x.txid as string);
+  } else {
+    ids = !o.noSend && subject && r.tx?.length ? [subject] : [];
+  }
+  if (o.noSend && subject) ids = ids.filter((t) => t !== subject);
+  const uniq = [...new Set(ids)];
+  return subject && uniq.includes(subject) ? [...uniq.filter((t) => t !== subject), subject] : uniq;
+}
+
+/** What `getVersion` answers from serve, in every mode, paired or not. 0.6.1+ never relays a noSend build. */
+const PKG_VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
+export const SERVE_VERSION = `bwalletx-serve-${PKG_VERSION}`;
+
 /** Calls a site may make. Everything else (privileged key linkage, certificates) is refused. */
 const ALLOWED = new Set([
   'createAction',
@@ -356,7 +387,7 @@ export const localBackend = (w: AgentWallet): ServeWallet => {
 };
 
 /** Phase 1 (read-only) and phase 2 (createAction/signAction: the phone prompts every time). */
-export const PAIRED_FORWARD = new Set(['getPublicKey', 'listOutputs', 'isAuthenticated', 'waitForAuthentication', 'getNetwork', 'getHeight', 'getVersion', 'createAction', 'signAction']);
+export const PAIRED_FORWARD = new Set(['getPublicKey', 'listOutputs', 'isAuthenticated', 'waitForAuthentication', 'getNetwork', 'getHeight', 'createAction', 'signAction']);
 /** Never leave the machine, whatever the mode. */
 export const NEVER_FORWARD = new Set(['revealCounterpartyKeyLinkage', 'revealSpecificKeyLinkage']);
 
@@ -403,8 +434,11 @@ export type ServeOptions = {
   origins: string[];
   port?: number;
   onEvent?: (line: string) => void;
-  /** For tests: what is called to hand a signed tx to ARC (local mode only). */
-  arc?: (result: unknown) => Promise<void>;
+  /**
+   * For tests: what is called to hand one signed tx to ARC (local mode only), as { txid, tx: AtomicBEEF }.
+   * Called only for txids the wallet itself broadcast or queued (see txidsToRelay), never for a noSend build.
+   */
+  arc?: (result: { txid: string; tx: number[] }) => Promise<void>;
   /** For tests: BSV price instead of fetching it. */
   usdPerBsv?: () => Promise<number>;
   /** Most one createAction may move, in USD, whatever the account's own caps say. Default SERVE_MAX_USD_PER_ACTION. */
@@ -469,6 +503,57 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
   const say = o.onEvent ?? (() => undefined);
   const arc = o.arc ?? relayToArc;
   const price = o.usdPerBsv ?? bsvUsd;
+  // noSend builds from this session (txid → AtomicBEEF), so a later sendWith can hand them to ARC; and the noSend
+  // option of each createAction waiting for signAction (the toolbox carries it over when signAction leaves it out).
+  const held = new Map<string, number[]>();
+  const signRefs = new Map<string, boolean>();
+  const remember = <V>(m: Map<string, V>, k: string, v: V) => {
+    m.delete(k);
+    m.set(k, v);
+    if (m.size > 500) m.delete(m.keys().next().value as string);
+  };
+  const beefFor = (txid: string, out: ActionResult): number[] | undefined => {
+    if (out.txid === txid && out.tx?.length) return out.tx;
+    const h = held.get(txid);
+    if (h) return h;
+    if (!out.tx?.length) return undefined;
+    try {
+      return Beef.fromBinary(Array.from(out.tx)).findAtomicTransaction(txid)?.toAtomicBEEF(true);
+    } catch {
+      return undefined;
+    }
+  };
+  /** After the CLI's own wallet built or signed: hold noSend builds, relay only what the wallet broadcast. */
+  const afterAction = (call: string, args: Record<string, unknown>, out: unknown, noSend: boolean) => {
+    const r = (out ?? {}) as ActionResult;
+    const ref = typeof args.reference === 'string' ? args.reference : undefined;
+    if (call === 'signAction' && ref) signRefs.delete(ref);
+    const pendingRef = r.signableTransaction?.reference;
+    if (call === 'createAction' && typeof pendingRef === 'string') remember(signRefs, pendingRef, noSend);
+    if (noSend && typeof r.txid === 'string' && r.tx?.length) remember(held, r.txid, Array.from(r.tx));
+    const ids = txidsToRelay(r, { noSend });
+    if (!ids.length) return;
+    const jobs = ids.map((txid) => ({ txid, tx: beefFor(txid, r) }));
+    void (async () => {
+      for (const j of jobs) {
+        if (!j.tx) {
+          say(`${j.txid}: sent by the wallet; not built in this serve session, so no ARC relay`);
+          continue;
+        }
+        await arc({ txid: j.txid, tx: j.tx }).catch(() => undefined);
+        held.delete(j.txid);
+      }
+    })();
+  };
+  /** Would the wallet hold this tx back? createAction: its own option. signAction: its option, else the createAction's. */
+  const isNoSend = (call: string, args: Record<string, unknown>) => {
+    const ns = (args.options as { noSend?: unknown } | undefined)?.noSend;
+    if (call === 'createAction') return ns === true;
+    if (typeof ns === 'boolean') return ns;
+    const ref = typeof args.reference === 'string' ? args.reference : undefined;
+    // Unknown reference: assume held. The toolbox refuses it anyway; the safe side is never to relay.
+    return ref !== undefined && signRefs.has(ref) ? (signRefs.get(ref) as boolean) : true;
+  };
 
   const send = (res: ServerResponse, status: number, body: unknown, origin?: string) => {
     res.writeHead(status, {
@@ -536,11 +621,13 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
     const authed = checkToken(host, bearerOf(req.headers.authorization));
     if (!authed) {
       if (req.method === 'POST' && UNAUTHENTICATED.has(call)) {
-        return send(res, 200, call === 'getVersion' ? { version: 'bwalletx-1.0.0' } : { authenticated: false }, origin);
+        return send(res, 200, call === 'getVersion' ? { version: SERVE_VERSION } : { authenticated: false }, origin);
       }
       say(`refused ${host} ${call || '(no call)'}: not paired (no valid token)`);
       return send(res, 401, refusal('bwalletx serve: this site is not paired; POST /pair and approve it in the serve terminal'), origin);
     }
+    // serve answers for itself, paired or not, so a client can tell a serve that holds noSend builds (0.6.1+) from an older one.
+    if (call === 'getVersion' && req.method === 'POST') return send(res, 200, { version: SERVE_VERSION }, origin);
     if (req.method !== 'POST' || !ALLOWED.has(call) || NEVER_FORWARD.has(call) || (w.paired && !PAIRED_FORWARD.has(call))) return send(res, 400, refusal(`bwalletx serve: ${call || 'this call'} is not offered`), origin);
 
     const chunks: Buffer[] = [];
@@ -603,21 +690,30 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
       sessionSpentUsd += usd; // reserved under the spend lock; a failed sign below gives it back
     }
 
+    // Read before the call: the toolbox fills args.options in place.
+    const acts = call === 'createAction' || call === 'signAction';
+    const noSend = acts && isNoSend(call, args);
     try {
       const out = await w.call(call, args, host);
-      // The phone broadcasts what it signs; only the CLI's own wallet needs the ARC nudge.
-      if (!w.paired && (call === 'createAction' || call === 'signAction')) arc(out).catch(() => undefined);
+      // The phone broadcasts what it signs; only the CLI's own wallet needs the ARC nudge, and only for what
+      // the wallet itself sent: never a noSend build (13 Nov 2026 review).
+      if (!w.paired && acts) afterAction(call, args, out, noSend);
+      if (!w.paired && call === 'abortAction' && typeof args.reference === 'string') {
+        held.delete(args.reference);
+        signRefs.delete(args.reference);
+      }
       if (LOGGED.has(call)) {
         const a = args as { description?: string };
         const r = out as { txid?: string };
         const usd = sats ? (sats / 1e8) * (await price().catch(() => 0)) : 0;
+        const tag = noSend && r?.txid ? ' (noSend: built, not sent)' : '';
         appendLog(o.account, {
           at: Date.now(),
           action: call === 'createAction' ? (sats ? 'send' : 'sign') : `brc100-${call}`,
-          detail: `${host}: ${call}${a.description ? ` "${a.description}"` : ''}${r?.txid ? ` ${r.txid}` : ''}${sats ? ` (${sats} sats)` : ''}`,
+          detail: `${host}: ${call}${a.description ? ` "${a.description}"` : ''}${r?.txid ? ` ${r.txid}` : ''}${sats ? ` (${sats} sats)` : ''}${tag}`,
           usd,
         });
-        say(`${host} ${call}${a.description ? `: ${a.description}` : ''}${r?.txid ? ` → ${r.txid}` : ''}`);
+        say(`${host} ${call}${a.description ? `: ${a.description}` : ''}${r?.txid ? ` → ${r.txid}` : ''}${tag}`);
       }
       send(res, 200, out ?? {}, origin);
     } catch (e) {

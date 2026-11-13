@@ -135,8 +135,9 @@ find it the same way they find BSV Desktop. Built on `@bsv/wallet-toolbox`; keys
   terminal and asks `y/N`. The response streams `{"code":"1234 5678"` at once (the site shows it so the owner can
   compare) and finishes with `,"approved":true,"token":"…"}` or `,"approved":false}`. Every other call must
   carry `Authorization: Bearer <token>`; without a valid token for that origin it gets 401. Only `getVersion` and
-  `isAuthenticated` answer unpaired (a fixed version string and `authenticated: false`), so sites can detect the
-  wallet. Tokens are random per origin and stored only as SHA-256 hashes in `~/.bwalletx/serve-pairings.json`
+  `isAuthenticated` answer unpaired (serve's version and `authenticated: false`), so sites can detect the
+  wallet. `getVersion` is always answered by serve itself, `bwalletx-serve-<version>` (0.6.1 or later never
+  relays a noSend build). Tokens are random per origin and stored only as SHA-256 hashes in `~/.bwalletx/serve-pairings.json`
   (0600). `bwalletx serve --list-pairings` lists them; `bwalletx serve --revoke <origin>` revokes one at once.
   Serve without a terminal (no TTY) refuses every pairing request.
 - **Host check**: serve binds to 127.0.0.1 and answers 403 unless the `Host` header is `localhost:<port>` or
@@ -145,6 +146,11 @@ find it the same way they find BSV Desktop. Built on `@bsv/wallet-toolbox`; keys
   (its outputs minus what the site's own inputs bring in), so the kill switch, daily cap, rate limit and a
   loaded strategy all apply. Refusals reach the site as a readable wallet error.
 - **Log**: every spend and signature lands in the activity log with the site and txid.
+- **noSend is respected**: serve also hands what the wallet sends to ARC, but only the txids the wallet itself
+  sent or queued. A `createAction`/`signAction` with `options.noSend` is returned signed and is not broadcast;
+  the later `createAction { options: { sendWith: [txid…] } }` sends it (or `abortAction` drops it). The caps
+  count the build, not the `sendWith` call, and an abort gives nothing back (the site already holds the signed
+  tx).
 - **Limits**: one payment from a site may move at most `--max-usd` (default $1) and the session at most
   `--budget-usd` (default $5).
 - **Tokens**: the caps value satoshis only, and a BSV-21 token output is 1 sat however much the token is

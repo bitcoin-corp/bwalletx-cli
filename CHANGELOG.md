@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.1 (unreleased)
+
+A money fix for `serve`. If an app uses noSend through `bwalletx serve`, upgrade.
+
+- **`serve` no longer broadcasts a transaction built with `noSend`.** In local and shared mode serve handed every
+  createAction/signAction result to ARC, including a "build only, don't send" one. An app doing a two-phase send
+  (build with `noSend`, check, then `sendWith` or `abortAction`) got a broadcast it didn't ask for; if it then
+  aborted, the wallet marked the action failed while the payment was on the network, so it could pay twice and
+  lose the record. serve now relays only the txids the wallet itself sent or queued (its `sendWithResults`, minus
+  any marked failed), never a noSend build itself. A later `createAction { options: { sendWith } }` relays exactly
+  those txids, parents first. signAction follows the noSend option of its createAction when it doesn't set one.
+  Paired mode never relayed and is unchanged.
+- **`getVersion` from serve now answers `bwalletx-serve-<version>`** (this release: `bwalletx-serve-0.6.1`),
+  paired or not, signed in or not. Older serves answered `bwalletx-1.0.0` before pairing and the wallet's own
+  `wallet-brc100-1.0.0` after. A client that relies on noSend should refuse anything that isn't
+  `bwalletx-serve-` 0.6.1 or later.
+- The account log marks a noSend build "(noSend: built, not sent)".
+
 ## 0.6.0 (unreleased)
 
 A safety release. If you let an AI agent use bwalletx, upgrade.

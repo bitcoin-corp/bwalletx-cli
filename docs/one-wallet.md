@@ -42,12 +42,13 @@ Moving funds from the CLI's own wallet into the main wallet is not part of this 
 
 - The origin allowlist (`--origin`); other sites get 403.
 - Request size (64 MB) and the method set. Forwarded: `getPublicKey`, `listOutputs`,
-  `isAuthenticated`, `waitForAuthentication`, `getNetwork`, `getHeight`, `getVersion`,
+  `isAuthenticated`, `waitForAuthentication`, `getNetwork`, `getHeight`,
   `createAction`, `signAction`. Everything else is refused locally.
 - Never forwarded: `revealCounterpartyKeyLinkage`, `revealSpecificKeyLinkage`, or any call with
   `privileged: true`.
 - `createAction` passes the local gate (kill switch, daily cap, rate limit, strategy) first.
 - No ARC relay in paired mode: the phone broadcasts what it signs.
+- `getVersion` is answered by serve itself (`bwalletx-serve-<version>`), not the phone.
 
 ### Wire format
 
