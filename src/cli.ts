@@ -7,7 +7,7 @@ import * as act from './actions.js';
 import * as mint from './mint.js';
 import * as sell from './sell.js';
 import * as b1 from './brc100Actions.js';
-import { login, unpair } from './paired.js';
+import { login, pingPhone, unpair } from './paired.js';
 import { agentRun } from './agent.js';
 import { confirm } from './passphrase.js';
 import { keyFilePath, allStopped, readConfig, resolveAccount, writeConfig, appendLog } from './store.js';
@@ -85,6 +85,14 @@ program
   .description('unpair a paired account (also disconnects it on the phone)')
   .option('-a, --account <name>', 'paired account', 'phone')
   .action(run(async (o: { account: string }) => (await unpair(o.account), console.log(`Unpaired ${o.account}.`))));
+
+program
+  .command('ping')
+  .description('check a paired account: is the pairing service reachable, is the phone connected, does it answer?')
+  .option('-a, --account <name>', 'paired account', 'phone')
+  .action(run(async (o: { account: string }) => {
+    if (!(await pingPhone(o.account))) process.exitCode = 1;
+  }));
 
 const key = program.command('key').description('agent account key files');
 key

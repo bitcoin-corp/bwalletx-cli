@@ -32,6 +32,7 @@ import {
   walletClaimFor,
   type HelloFrame,
   type PairMessage,
+  type RelayFrame,
 } from './pair/protocol.js';
 import { inOrder } from './pair/in-order.js';
 import { DEFAULT_DAILY_CAP_USD, home, readConfig, readJsonFile, writeConfig, writeJsonFile } from './store.js';
@@ -423,6 +424,61 @@ export async function callBrc100<T = unknown>(
   const params = { method, args, site };
   if (o.session) return o.session.call<T>('brc100', params, o.timeoutMs ?? CALL_TIMEOUT_MS);
   return callPhone<T>(name, 'brc100', params, o.timeoutMs ?? CALL_TIMEOUT_MS);
+}
+
+/**
+ * `bwalletx ping`: is the pairing service reachable, is the phone on the channel, does it answer? Sends one sealed
+ * ping (counters saved like any request) and reports each step, so "No answer from your phone" can be traced.
+ */
+export async function pingPhone(name: string, out: (s: string) => void = console.log, timeoutMs = 15_000): Promise<boolean> {
+  const p = readPairing(name);
+  if (!p) throw new Error(`"${name}" isn't a paired account`);
+  out(`Pairing "${name}": phone account "${p.account}", relay ${p.r}, channel ${p.c.slice(0, 6)}…, expires ${new Date(p.expiresAt).toISOString().slice(0, 10)}`);
+  if (Date.now() > p.expiresAt) return (out('The pairing expired. Pair again.'), false);
+  const { key } = await deriveSession(PrivateKey.fromHex(p.s), p.k, p.c);
+  const sealer = new Sealer(key, 'site');
+  sealer.restore({ sent: p.sent, lastSeen: p.lastSeen });
+  const ws = open(pairedSiteUrl(p, Math.floor(Date.now() / 1000) + QR_LIFETIME_S - 10));
+  return new Promise<boolean>((resolve) => {
+    let answered = false;
+    const finish = (ok: boolean) => {
+      clearTimeout(timer);
+      ws.close();
+      resolve(ok);
+    };
+    const timer = setTimeout(() => {
+      out(`No answer from the phone in ${timeoutMs / 1000}s. bWalletX on "${p.account}" isn't connected to this pairing.`);
+      finish(false);
+    }, timeoutMs);
+    ws.on('unexpected-response', (_req, res) => {
+      out(`Pairing service refused the connection: HTTP ${res.statusCode} ${res.statusMessage ?? ''}`.trim());
+      finish(false);
+    });
+    ws.on('error', (e) => (out(`Pairing service unreachable: ${e.message}`), finish(false)));
+    ws.on('close', (code, reason) => !answered && out(`Pairing service closed the connection (${code}${reason.length ? ` ${reason}` : ''}).`));
+    ws.on('open', async () => {
+      out('Pairing service: connected. Asking the phone…');
+      ws.send(JSON.stringify(await sealer.seal({ t: 'ping' })));
+      savePairing({ ...readPairing(name)!, ...sealer.counters });
+    });
+    ws.on('message', inOrder(async (raw: unknown) => {
+      const f = parseFrame(String(raw));
+      if (!f) return;
+      const rf = f as RelayFrame;
+      if (rf.t === 'relay') {
+        if (rf.peer) out(`Pairing service: the phone ${rf.peer === 'joined' ? 'joined' : 'left'} the channel.`);
+        if (rf.error) out(`Pairing service: ${rf.error}`);
+        return;
+      }
+      if (!isSealed(f)) return;
+      const msg = await sealer.open(f);
+      if (!msg) return out('A frame arrived that this pairing could not open (wrong key or replayed).');
+      savePairing({ ...readPairing(name)!, ...sealer.counters });
+      answered = true;
+      out(`The phone answered (${msg.t}). Paired and online.`);
+      finish(true);
+    }));
+  });
 }
 
 /** Forget a pairing here (and tell the phone, best effort). */
