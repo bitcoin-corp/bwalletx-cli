@@ -40,9 +40,9 @@ import {
 import { LockingScript, P2PKH, PublicKey, Transaction, type CreateActionArgs, type CreateActionOutput, type Script, type WalletInterface, type WalletOutput } from '@bsv/sdk';
 import { MARKET_FEE_ADDRESS, MARKET_FEE_RATE, marketFeeSats } from './buy.js';
 import { gateAction, reserveSpend, watchBroadcast, type Reserved } from './gate.js';
-import { bsvUsd, outpointUnspent, overlayFee, tokenPrice } from './market.js';
+import { bsvUsd, listings as marketListings, outpointUnspent, overlayFee, type Listing } from './market.js';
 import { nameValueUsd } from './opns/opnsOutputs.js';
-import { allStopped, appendLog, home, readJsonFile, writeJsonFile } from './store.js';
+import { allStopped, appendLog, home, readConfig, readJsonFile, writeJsonFile } from './store.js';
 import { rawTx } from './wallet.js';
 import type { AgentLogEntry, ActionRequest } from './strategy.js';
 
@@ -56,7 +56,20 @@ export function parseOutpoint(s: string) {
   const vout = Number(m[2]);
   return { txid, vout, us: `${txid}_${vout}`, dot: `${txid}.${vout}` };
 }
-const sameOutpoint = (a: string, b: string) => a.replace('.', '_').toLowerCase() === b.replace('.', '_').toLowerCase();
+const normOutpoint = (s: string) => s.replace('.', '_').toLowerCase();
+const sameOutpoint = (a: string, b: string) => normOutpoint(a) === normOutpoint(b);
+
+export type OurListings = { outpoints: Set<string>; sellers: Set<string> };
+
+/**
+ * The market floor (sats per whole token) from listings that are not ours, so an agent can't walk the floor down
+ * with its own listings. `onlyOurs` when every live listing is ours: the floor can't be read without them.
+ */
+export function externalFloor(ls: Listing[], ours: OurListings): { floorSatsPerToken: number | null; onlyOurs: boolean } {
+  const theirs = ls.filter((l) => !ours.outpoints.has(normOutpoint(l.outpoint)) && !(l.seller && ours.sellers.has(l.seller)) && Number.isFinite(l.pricePerTokenSats) && l.pricePerTokenSats > 0);
+  const floor = theirs.reduce<number | null>((m, l) => (m === null || l.pricePerTokenSats < m ? l.pricePerTokenSats : m), null);
+  return { floorSatsPerToken: floor, onlyOurs: ls.length > 0 && theirs.length === 0 };
+}
 
 /** Cancel key per token: deterministic, so a lost record can still be cancelled (bWalletX sell.ts cancelKeyID). */
 export const cancelKeyID = (tokenId: string) => `ordlock-${tokenId.replace('.', '_')}`;
@@ -150,8 +163,12 @@ export type SellDeps = {
   unspent: (outpoint: string) => Promise<boolean>;
   rate: () => Promise<number>;
   overlayFee: (tokenId: string) => Promise<{ address: string; sats: number } | null>;
-  /** BSV-21 market floor in USD per whole token (cheapest live listing), null when nothing is listed. */
-  tokenFloorUsd: (tokenId: string) => Promise<number | null>;
+  /** Live BSV-21 listings of a token (the market floor is worked out from them, leaving ours out). */
+  tokenListings: (tokenId: string) => Promise<Listing[]>;
+  /** Listings this CLI's accounts made (recorded outpoints) and their addresses: left out of the floor. */
+  ourListings: () => OurListings;
+  /** Owner approval at a terminal (ownerGate.ts requireOwner): throws when it can't be given. */
+  ownerApprove: (what: string) => Promise<void>;
   gate: (name: string, a: ActionRequest) => { ok: true; paper: boolean } | { ok: false; reason: string };
   /** Buys: gate + reserve the dollars before signing (gate.ts reserveSpend); settled or released after. */
   reserve: (name: string, a: ActionRequest) => Promise<Reserved>;
@@ -246,7 +263,20 @@ const defaultDeps = (): SellDeps => ({
   unspent: outpointUnspent,
   rate: bsvUsd,
   overlayFee,
-  tokenFloorUsd: async (id) => (await tokenPrice(id)).floorUsdPerToken,
+  tokenListings: async (id) => (await marketListings(id)).listings,
+  ourListings: () => {
+    const outpoints = new Set<string>();
+    const sellers = new Set<string>();
+    for (const a of Object.values(readConfig().accounts)) {
+      for (const x of [a.identityAddress, a.payAddress, a.ordAddress]) if (x) sellers.add(x);
+      for (const r of readJsonFile<TokenRecord[]>(recordsPath(a.name)) ?? []) outpoints.add(normOutpoint(r.outpoint));
+    }
+    return { outpoints, sellers };
+  },
+  ownerApprove: async (what) => {
+    const { requireOwner } = await import('./ownerGate.js');
+    await requireOwner(what);
+  },
   gate: (name, a) => gateAction(name, a),
   reserve: (name, a) => reserveSpend(name, a),
   stopped: allStopped,
@@ -352,6 +382,7 @@ export async function listForSale(o: ListOpts): Promise<SellResult> {
     let run: () => Promise<{ res: Res; built?: BuiltTx; mayHaveBroadcast?: boolean }>;
     let record: Omit<TokenRecord, 'outpoint' | 'createdAt'> | null = null;
     let tokens = 0; // BSV-21: whole tokens listed
+    let cancelAddress: string | null = null; // BSV-21: this wallet's listing (seller) address for the token
     if (own.kind === 'token') {
       const t = own.token;
       const raw = o.amount ? toRaw(o.amount, t.dec) : t.amt;
@@ -360,6 +391,7 @@ export async function listForSale(o: ListOpts): Promise<SellResult> {
       const keyID = cancelKeyID(t.id);
       const { publicKey } = await acct.ctx.wallet.getPublicKey({ protocolID: P1SAT_PROTOCOL, keyID, counterparty: 'self', forSelf: true });
       const cancel = PublicKey.fromString(publicKey).toAddress();
+      cancelAddress = cancel;
       const pay = await defaultPayAddress(acct.ctx);
       const script = buildListingScript(t.id, raw, cancel, pay, o.priceSats);
       const back = decodeAnyListing(script);
@@ -382,27 +414,48 @@ export async function listForSale(o: ListOpts): Promise<SellResult> {
     // A listing below what the item is worth gives the difference away to whoever buys it (an accomplice can buy a
     // $500 name listed at 1 sat). So the shortfall is gated and reserved against the daily cap, approval threshold and
     // strategy limits like a send: OpNS names at their listing tier (the top tier when the name can't be read), BSV-21
-    // tokens at the market floor. A missing BSV price counts the whole value (fail closed). Ordinals have no known
-    // value here, so they are gated at $0 (README: what the USD cap does not cover).
+    // tokens at the market floor without our own listings in it. A missing BSV price counts the whole value (fail
+    // closed). Ordinals have no known value, so listing one needs the owner's approval at a terminal (below).
     let valueUsd = 0;
-    if (own.kind === 'opns') valueUsd = nameValueUsd(own.output);
-    else if (own.kind === 'token') {
-      let floor: number | null;
-      try {
-        floor = await d.tokenFloorUsd(own.token.id);
-      } catch (e) {
-        return { ok: false, text: `Refused: couldn't read the market floor to value this listing (${e instanceof Error ? e.message : String(e)}); try again` };
-      }
-      valueUsd = floor != null && floor > 0 ? floor * tokens : 0;
-    }
+    let shortUsd = 0;
     const priceUsd = (o.priceSats / 1e8) * rate;
-    const shortUsd = Math.max(0, valueUsd - priceUsd);
+    if (own.kind === 'opns') {
+      valueUsd = nameValueUsd(own.output);
+      shortUsd = Math.max(0, valueUsd - priceUsd);
+    } else if (own.kind === 'token') {
+      const refuseFloor = (why: string) => ({ ok: false, text: `Refused: couldn't read the market floor to value this listing (${why}); try again` });
+      let floor: ReturnType<typeof externalFloor>;
+      try {
+        const ours = d.ourListings();
+        if (cancelAddress) ours.sellers.add(cancelAddress);
+        // Listings this wallet holds (made here or by the app) are ours too.
+        const held = await acct.ctx.wallet.listOutputs({ basket: BSV21_BASKET, includeTags: true, limit: 10_000 }, 'bwalletx-cli');
+        for (const x of held.outputs) if (isListed(x)) ours.outpoints.add(normOutpoint(x.outpoint));
+        floor = externalFloor(await d.tokenListings(own.token.id), ours);
+      } catch (e) {
+        return refuseFloor(e instanceof Error ? e.message : String(e));
+      }
+      if (floor.onlyOurs) return refuseFloor('every live listing is from this wallet');
+      const shortSats = floor.floorSatsPerToken ? Math.max(0, floor.floorSatsPerToken * tokens - o.priceSats) : 0;
+      if (shortSats > 0 && !(rate > 0)) return { ok: false, text: 'Refused: no BSV price to value a listing below the market floor; try again' };
+      valueUsd = floor.floorSatsPerToken ? ((floor.floorSatsPerToken * tokens) / 1e8) * rate : 0;
+      shortUsd = (shortSats / 1e8) * rate;
+    }
     const g = await d.reserve(acct.name, { kind: 'list', token: own.token?.id ?? (own.kind === 'opns' ? 'opns' : 'ordinal'), ...(own.token?.sym && { ticker: own.token.sym }), usd: shortUsd });
     if (!g.ok) return { ok: false, text: `Refused: ${g.reason}` };
     if (g.paper) return { ok: false, text: 'Paper mode: nothing is signed (load the strategy --live, or unload it)' };
     const below = shortUsd > 0 ? ` That is ${fmtUsd(shortUsd)} below its ${fmtUsd(valueUsd)} value, and the difference counts against today's cap.` : '';
     let state: 'idle' | 'signing' | 'done' = 'idle';
     try {
+      if (own.kind === 'ordinal') {
+        // No known value, so the cap can't cover it: the owner approves each ordinal listing at a terminal (owner PIN).
+        // Under MCP, without a TTY, or in an agent's shell this refuses and nothing is listed.
+        try {
+          await d.ownerApprove(`list ${what} for ${priceText} from ${acct.name}`);
+        } catch (e) {
+          return { ok: false, text: e instanceof Error && e.message.startsWith('Refused') ? e.message : `Refused: owner approval needed to list an ordinal (${e instanceof Error ? e.message : String(e)})` };
+        }
+      }
       if (o.confirm && !(await o.confirm(`List ${what} for ${priceText} from ${acct.name}? Anyone can buy it at that price until you unlist it.${below}`))) return { ok: false, text: 'Not confirmed (pass --yes to skip)' };
       state = 'signing';
       const { res, mayHaveBroadcast } = await run();

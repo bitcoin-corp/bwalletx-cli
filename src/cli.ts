@@ -298,7 +298,7 @@ const printSell = (r: sell.SellResult) => {
 program
   .command('list <outpoint>')
   .description('list an ordinal, OpNS name or BSV-21 token output from the account wallet on the 1Sat order book (OrdLock v2)')
-  .requiredOption('--price <sats>', 'asking price in sats (whole listing); below an OpNS tier or BSV-21 floor, the shortfall counts against the cap')
+  .requiredOption('--price <sats>', 'asking price in sats (whole listing); below an OpNS tier or BSV-21 floor, the shortfall counts against the cap; ordinals need the owner PIN')
   .option('--amount <n>', 'BSV-21 only: list this many tokens from the output (default: all of it)')
   .option('-a, --account <name>', 'agent account (its BRC-100 wallet signs)')
   .option('-y, --yes', 'do not ask for confirmation')

@@ -8,6 +8,7 @@ import {
   cancelKeyID,
   decodeAnyListing,
   dryRunWallet,
+  externalFloor,
   DRY_RUN_STOP,
   fromRaw,
   listForSale,
@@ -99,6 +100,7 @@ function setup(baskets: Baskets, over: Partial<SellDeps> = {}) {
     release: vi.fn(),
     sendWaiting: vi.fn(async () => undefined),
     close: vi.fn(async () => undefined),
+    ownerApprove: vi.fn(async (_what: string) => undefined),
   };
   const simple = builder(() => ({ description: 'stub', inputs: [{ outpoint: `${TXID}.0`, inputDescription: 'in', unlockingScriptLength: 108 }], outputs: [{ lockingScript: '00', satoshis: 1, outputDescription: 'out' }] }));
   const actions = {
@@ -136,7 +138,9 @@ function setup(baskets: Baskets, over: Partial<SellDeps> = {}) {
     unspent: async () => true,
     rate: async () => 50,
     overlayFee: async () => ({ address: addr(), sats: 1000 }),
-    tokenFloorUsd: async () => null,
+    tokenListings: async () => [],
+    ourListings: () => ({ outpoints: new Set<string>(), sellers: new Set<string>() }),
+    ownerApprove: calls.ownerApprove,
     gate: calls.gate,
     stopped: () => false,
     log: calls.log,
@@ -250,18 +254,80 @@ describe('list below value: the shortfall counts against the cap (review fix)', 
 
   test('BSV-21 below the market floor counts the shortfall; an unreadable floor refuses', async () => {
     // 5000 raw at 2 decimals = 50 TEST; floor $0.01/token = $0.50.
-    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenFloorUsd: async () => 0.01 });
+    // $0.01/token at $50/BSV = 20,000 sats per token.
+    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => [mkt('e1', 20_000)] });
     await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 });
     expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ kind: 'list', token: TOKEN, usd: expect.closeTo(0.5, 4) }));
-    const u = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenFloorUsd: async () => Promise.reject(new Error('GorillaPool down')) });
+    const u = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => Promise.reject(new Error('GorillaPool down')) });
     expect((await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 })).text).toMatch(/Refused: couldn't read the market floor/);
     expect(u.actions.sendBsv21.execute).not.toHaveBeenCalled();
   });
 
-  test('ordinals have no known value: still a $0 list (documented gap)', async () => {
+  test('ordinals have no known value: gated as a $0 list, then the owner approves at a terminal', async () => {
     const t = setup({ [ORDINALS_BASKET]: [out(`${TXID}.0`, ['id:o1'])] });
-    await listForSale({ outpoint: `${TXID}_0`, priceSats: 1 });
+    expect((await listForSale({ outpoint: `${TXID}_0`, priceSats: 1 })).ok).toBe(true);
     expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ kind: 'list', token: 'ordinal', usd: 0 }));
+    expect(t.calls.ownerApprove).toHaveBeenCalledWith(expect.stringMatching(/^list ordinal .* for 1 sats/));
+  });
+});
+
+const mkt = (tag: string, perToken: number, seller: string | null = null) => ({ outpoint: `${tag.padEnd(64, '0')}_0`, priceSats: perToken, amount: '1', tokens: 1, seller, pricePerTokenSats: perToken });
+
+describe('BSV-21 floor leaves out our own listings (review fix 2)', () => {
+  const none = () => ({ outpoints: new Set<string>(), sellers: new Set<string>() });
+
+  test('externalFloor skips our outpoints and addresses; onlyOurs when nothing else is listed', () => {
+    const ours = { outpoints: new Set([`${'a1'.padEnd(64, '0')}_0`]), sellers: new Set(['1Me']) };
+    expect(externalFloor([mkt('a1', 1), mkt('b1', 5, '1Me'), mkt('c1', 900), mkt('d1', 700)], ours)).toEqual({ floorSatsPerToken: 700, onlyOurs: false });
+    expect(externalFloor([mkt('a1', 1), mkt('b1', 5, '1Me')], ours)).toEqual({ floorSatsPerToken: null, onlyOurs: true });
+    expect(externalFloor([], none())).toEqual({ floorSatsPerToken: null, onlyOurs: false });
+  });
+
+  test("an agent can't walk the floor down: its recorded, wallet-held and own-address listings are left out", async () => {
+    const recorded = mkt('a1', 1); // listed by another account in this CLI (its records file)
+    const held = mkt('b2', 2); // a listing this wallet holds
+    const mine = mkt('c3', 3, key.toPublicKey().toAddress()); // this wallet's cancel address for the token
+    const t = setup(
+      { [BSV21_BASKET]: [tokenOut(`${TXID}.1`), out(held.outpoint.replace('_', '.'), ['ordlock', `bsv21:${TOKEN}`])] },
+      { tokenListings: async () => [recorded, held, mine, mkt('e1', 20_000)], ourListings: () => ({ outpoints: new Set([recorded.outpoint]), sellers: new Set(['1Other']) }) },
+    );
+    await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 });
+    expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ usd: expect.closeTo(0.5, 4) }));
+  });
+
+  test('only our own listings on the market: refused, nothing listed', async () => {
+    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => [mkt('a1', 1, '1Other')], ourListings: () => ({ outpoints: new Set<string>(), sellers: new Set(['1Other']) }) });
+    expect((await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 })).text).toMatch(/Refused: couldn't read the market floor to value this listing \(every live listing is from this wallet\)/);
+    expect(t.actions.sendBsv21.execute).not.toHaveBeenCalled();
+    expect(t.calls.gate).not.toHaveBeenCalled();
+  });
+});
+
+describe('ordinal listings need the owner (review fix 2)', () => {
+  test('refused when the owner can not approve: nothing listed, reservation released', async () => {
+    const t = setup({ [ORDINALS_BASKET]: [out(`${TXID}.0`, ['id:o1'])] }, { ownerApprove: async () => Promise.reject(new Error('Refused under MCP: no')) });
+    expect(await listForSale({ outpoint: `${TXID}_0`, priceSats: 1 })).toMatchObject({ ok: false, text: 'Refused under MCP: no' });
+    expect(t.actions.sellOrdinal.execute).not.toHaveBeenCalled();
+    expect(t.calls.release).toHaveBeenCalledOnce();
+  });
+
+  test('the real owner gate refuses without a terminal (tests have no TTY) and under MCP', async () => {
+    const { requireOwner } = await import('./ownerGate');
+    for (const env of [undefined, '1']) {
+      if (env) process.env.BWALLETX_UNDER_MCP = env;
+      const t = setup({ [ORDINALS_BASKET]: [out(`${TXID}.0`, ['id:o1'])] }, { ownerApprove: async (w) => void (await requireOwner(w)) });
+      const r = await listForSale({ outpoint: `${TXID}_0`, priceSats: 1 });
+      expect(r).toMatchObject({ ok: false, text: expect.stringMatching(env ? /Refused under MCP/ : /Refused: .*interactive terminal/) });
+      expect(t.actions.sellOrdinal.execute).not.toHaveBeenCalled();
+    }
+    delete process.env.BWALLETX_UNDER_MCP;
+  });
+
+  test('OpNS names and BSV-21 do not ask the owner', async () => {
+    const t = setup({ [OPNS_BASKET]: [out(`${TXID}.2`, ['id:n1', 'name:alice'])], [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] });
+    await listForSale({ outpoint: `${TXID}_2`, priceSats: 1 });
+    await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 });
+    expect(t.calls.ownerApprove).not.toHaveBeenCalled();
   });
 });
 
