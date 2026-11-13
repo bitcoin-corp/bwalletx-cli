@@ -17,6 +17,11 @@ const VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.
 const program = new Command();
 let asJson = false;
 const print = (v: unknown, human?: () => string) => console.log(asJson || !human ? JSON.stringify(v, null, 2) : human());
+// Pairing finishes only on a yes here (see LoginOptions.confirmCode), so it needs a terminal to ask in.
+const askCode = (code: string) => confirm(`Does your phone show the code ${code}?`);
+const needTerminal = () => {
+  if (!process.stdin.isTTY) throw new Error('Run this in a terminal: you confirm the pairing code there.');
+};
 const usd = (n: number | null | undefined) => (n == null ? '—' : n >= 0.01 || n === 0 ? `$${n.toFixed(2)}` : `$${n.toPrecision(3)}`);
 const run =
   <A extends unknown[]>(fn: (...a: A) => Promise<void> | void) =>
@@ -44,9 +49,10 @@ program
   .option('-a, --account <name>', 'local name for this paired account', 'phone')
   .action(
     run(async (o: { account: string }) => {
+      needTerminal();
       const owner = await og.requireOwner(`pair a phone account as "${o.account}"`);
       if (!asJson) await banner();
-      const p = await login(o.account, {});
+      const p = await login(o.account, { confirmCode: askCode });
       og.approveNewAccount(owner, p.name);
       console.log(`\nPaired "${p.name}" with ${p.account}: ${p.scopes.join(', ')} until ${new Date(p.expiresAt).toLocaleDateString()}.`);
       console.log('Keep bWalletX open on that account while the CLI works. Try: bwalletx balance --account ' + p.name);
@@ -60,9 +66,10 @@ program
   .option('-a, --account <name>', 'local name for this pairing', 'main')
   .action(
     run(async (o: { account: string }) => {
+      needTerminal();
       const owner = await og.requireOwner(`pair your main wallet as "${o.account}"`);
       if (!asJson) await banner();
-      const p = await login(o.account, { mode: 'brc100' });
+      const p = await login(o.account, { mode: 'brc100', confirmCode: askCode });
       og.approveNewAccount(owner, p.name);
       console.log(`\nPaired "${p.name}" with ${p.account} as your main wallet until ${new Date(p.expiresAt).toLocaleDateString()}.`);
       console.log(`Serve it to sites: bwalletx serve --wallet paired --account ${p.name} --origin <site>. Revoke: bwalletx logout --account ${p.name}`);

@@ -63,7 +63,17 @@ export type Pairing = {
   wv?: 2;
 };
 export type Brc100Caps = { dailyUsd?: number; perCallUsd?: number; origins?: string[] };
-export type LoginOptions = { mode?: 'agent' | 'brc100' };
+export type LoginOptions = {
+  mode?: 'agent' | 'brc100';
+  /**
+   * Ask whether the phone shows the same code; true only on a yes. With it, nothing is saved until the phone's Pair
+   * AND a yes; a no tells the phone to unpair. Whoever joins the QR's channel first gets it, so a stranger who used
+   * the QR first shows a different code (and the user's phone says the code was already used).
+   */
+  confirmCode?: (code: string) => Promise<boolean>;
+  /** Relay host. Default relay.bwallet.space (tests use a local one). */
+  relay?: string;
+};
 export type MintInfo = { maxItems: number; maxUsd: number; itemsUsed: number; spentUsd: number; itemsLeft: number; usdLeft: number };
 
 const file = (name: string) => join(home(), 'paired', `${name}.json`);
@@ -107,25 +117,27 @@ export async function login(name: string, opts: LoginOptions = {}, out: (s: stri
   if (!/^[A-Za-z0-9._-]{1,40}$/.test(name) || name.startsWith('.')) throw new Error(`Bad account name "${name}"`);
   const deadline = Date.now() + 5 * 60_000;
   while (Date.now() < deadline) {
-    const r = await round(name, opts.mode ?? 'agent', out);
+    const r = await round(name, opts.mode ?? 'agent', out, opts.confirmCode, opts.relay ?? DEFAULT_RELAY);
     if (r) return r;
     out('\nThe code expired; here is a new one.\n');
   }
   throw new Error('Pairing timed out. Run `bwalletx login` again.');
 }
 
-function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void): Promise<Pairing | null> {
+function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void, confirmCode: LoginOptions['confirmCode'], relay: string): Promise<Pairing | null> {
   const S = PrivateKey.fromRandom();
   const c = newChannel();
   const e = Math.floor(Date.now() / 1000) + QR_LIFETIME_S;
-  const link = pairUrl({ v: PAIR_VERSION, r: DEFAULT_RELAY, c, k: S.toPublicKey().toString(), o: CLI_ORIGIN, e });
+  const link = pairUrl({ v: PAIR_VERSION, r: relay, c, k: S.toPublicKey().toString(), o: CLI_ORIGIN, e });
   const sc = newClaim();
   return new Promise((resolve, reject) => {
-    const ws = open(newChannelUrl(DEFAULT_RELAY, c, S.toPublicKey().toString(), e, sc));
+    const ws = open(newChannelUrl(relay, c, S.toPublicKey().toString(), e, sc));
     let sealer: Sealer | null = null;
     let phoneKey = '';
     let v2 = false;
     let infoId = '';
+    let answer: Promise<boolean> | null = null; // the user's reply to confirmCode
+    let done = false;
     const timer = setTimeout(() => !sealer && (ws.close(), resolve(null)), QR_LIFETIME_S * 1000 - 5000);
     ws.on('open', async () => {
       out(brandQr(await QRCode.toString(link, { type: 'terminal', small: true })));
@@ -151,13 +163,30 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void)
         v2 = (f as HelloFrame).wcv === 2;
         const { key, code } = await deriveSession(S, phoneKey, c);
         sealer = new Sealer(key, 'site');
-        out(`Check your phone shows the code  ${code}  then choose what the CLI may do and tap Pair.`);
+        if (!confirmCode) {
+          out(`Check your phone shows the code  ${code}  then choose what the CLI may do and tap Pair.`);
+          return;
+        }
+        out(`On your phone, choose what the CLI may do and tap Pair. The code is  ${code}`);
+        const ask = confirmCode;
+        answer = new Promise<boolean>((r) => r(ask(code))).catch(() => false);
+        void answer.then(async (ok) => {
+          if (ok || done || !sealer) return;
+          done = true;
+          await sealer.seal({ t: 'close', reason: 'codes did not match' }).then((fr) => ws.send(JSON.stringify(fr))).catch(() => {});
+          ws.close();
+          reject(new Error("The codes didn't match, so nothing was paired. Run the command again for a new code."));
+        });
+        if (!(await answer)) return;
+        out('Code confirmed.');
         return;
       }
       if (!sealer || !isSealed(f)) return;
       const msg = await sealer.open(f);
       if (!msg) return;
       if (msg.t === 'ready') {
+        if (answer && !(await answer)) return; // a no unpairs the phone and rejects (above)
+        if (done) return;
         infoId = `info-${Date.now()}`;
         ws.send(JSON.stringify(await sealer.seal({ t: 'req', id: infoId, action: 'info', params: mode === 'brc100' ? { mode } : {} })));
       } else if (msg.t === 'res' && msg.id === infoId) {
@@ -168,7 +197,7 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void)
           format: 'bwalletx.pairing/1',
           name,
           c,
-          r: DEFAULT_RELAY,
+          r: relay,
           s: S.toHex(),
           k: phoneKey,
           ...sealer.counters,
