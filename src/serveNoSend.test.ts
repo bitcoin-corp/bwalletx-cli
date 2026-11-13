@@ -15,7 +15,8 @@ import { P2PKH, PrivateKey, Script, Transaction } from '@bsv/sdk';
 const dir = mkdtempSync(join(tmpdir(), 'bwx-serve-nosend-'));
 process.env.BWALLETX_HOME = dir;
 const { writeConfig, readLog } = await import('./store');
-const { serve, txidsToRelay, serveVersion, VERSION_FALLBACK, feeOf } = await import('./brc100');
+const { serve, txidsToRelay, serveVersion, VERSION_FALLBACK, feeOf, pinLevelOf, versionWithPin } = await import('./brc100');
+const { Beef } = await import('@bsv/sdk');
 const { issueToken } = await import('./servePairing');
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string };
 
@@ -44,6 +45,8 @@ function fakeToolbox(failed: Set<string>) {
   const sent = new Set<string>();
   const pending = new Map<string, { opts: Opts; t: Transaction; change: number }>();
   const calls: { m: string; args: Args }[] = [];
+  /** Test controls: make the next send step (sendWith-only createAction) throw; make abortAction refuse (tx already out). */
+  const ctl = { throwOnSend: false, abortRefuses: false };
   const statusOf = (txid: string) => (failed.has(txid) || aborted.has(txid) || !built.has(txid) ? 'failed' : 'sending');
   const share = (txids: string[]) => txids.map((txid) => ({ txid, status: statusOf(txid) }));
   const make = (args: Args) => {
@@ -77,6 +80,10 @@ function fakeToolbox(failed: Set<string>) {
     if (m === 'createAction') {
       const isNew = !!(args.outputs?.length || args.inputs?.length) || !opts.sendWith?.length;
       if (!isNew) {
+        if (ctl.throwOnSend) {
+          ctl.throwOnSend = false;
+          throw new Error('simulated storage failure on send');
+        }
         const r = share(opts.sendWith ?? []);
         for (const x of r) if (x.status !== 'failed') sent.add(x.txid);
         return { sendWithResults: r };
@@ -96,12 +103,13 @@ function fakeToolbox(failed: Set<string>) {
       return finish(prior.t, prior.change, { noSend: args.options?.noSend ?? prior.opts.noSend, sendWith: args.options?.sendWith ?? prior.opts.sendWith });
     }
     if (m === 'abortAction') {
+      if (ctl.abortRefuses) throw new Error('The reference parameter must be an inprocess, outgoing action that has not been signed and shared to the network.');
       aborted.add(args.reference ?? '');
       return { aborted: true };
     }
     return {};
   };
-  return { call, calls, built, aborted, sent };
+  return { call, calls, built, aborted, sent, ctl };
 }
 
 const cleanups: (() => unknown)[] = [];
@@ -385,5 +393,99 @@ describe('getVersion', () => {
 
   it('the compiled-binary fallback version matches package.json', () => {
     expect(VERSION_FALLBACK).toBe(pkg.version);
+  });
+});
+
+describe('knownTxids (13 Nov 2026 re-review)', () => {
+  it('serve builds with the full BEEF to price the fee, then trims the reply to what the site declared', async () => {
+    const { post, fake } = await setup();
+    const a = await post('createAction', pay(1000, { noSend: true }));
+    const b = await post('createAction', pay(1000, { noSendChange: a.body.noSendChange as string[], knownTxids: [a.body.txid as string] } as Opts));
+    expect(b.status, JSON.stringify(b.body)).toBe(200);
+    const build = fake.calls.filter((c) => c.m === 'createAction' && c.args.outputs?.length).at(-1)!;
+    expect((build.args.options as { knownTxids?: string[] }).knownTxids).toEqual([]);
+    const beef = Beef.fromBinary(b.body.tx as number[]);
+    expect(beef.findTxid(a.body.txid as string)?.isTxidOnly).toBe(true);
+    expect(beef.findTxid(b.body.txid as string)?.isTxidOnly).toBe(false);
+    expect(beef.txs).toHaveLength(2); // a's own parent isn't carried once a is omitted
+  });
+});
+
+describe('a failed send leaves nothing stuck (13 Nov 2026 re-review)', () => {
+  it('the send step throws: serve aborts the build, refunds, names the txid', async () => {
+    const { post, fake, relayed, settle, account } = await setup({ serve: { sessionBudgetUsd: 0.6 } });
+    fake.ctl.throwOnSend = true;
+    const r = await post('createAction', pay(1_000_000)); // $0.50
+    expect(r.status).toBe(400);
+    expect(typeof r.body.txid).toBe('string');
+    expect(r.body.aborted).toBe(true);
+    expect(String(r.body.message)).toMatch(/not sent .* aborted, so nothing was paid/);
+    expect(fake.aborted.has(r.body.txid as string)).toBe(true);
+    await settle();
+    expect(relayed).toEqual([]);
+    expect(readLog(account).filter((e) => e.action === 'send')).toEqual([]);
+    // The $0.50 came back to the session budget.
+    expect((await post('createAction', pay(1_000_000))).status).toBe(200);
+  });
+
+  it('the send step throws and the wallet refuses the abort (it may be out): txid named, still counted and logged', async () => {
+    const { post, fake, account } = await setup({ serve: { sessionBudgetUsd: 0.6 } });
+    fake.ctl.throwOnSend = true;
+    fake.ctl.abortRefuses = true;
+    const r = await post('createAction', pay(1_000_000));
+    expect(r.status).toBe(400);
+    expect(r.body.aborted).toBe(false);
+    expect(String(r.body.message)).toMatch(new RegExp(`check ${r.body.txid} before paying again`));
+    const sends = readLog(account).filter((e) => e.action === 'send');
+    expect(sends).toHaveLength(1);
+    expect(sends[0].detail).toMatch(/send failed/);
+    fake.ctl.abortRefuses = false;
+    expect((await post('createAction', pay(1_000_000))).status).toBe(400); // budget still used
+    // The site can retry its own build.
+    expect((await post('createAction', { description: 'retry the send', options: { sendWith: [r.body.txid] } })).status).toBe(200);
+  });
+});
+
+describe('abort needs a known owner (13 Nov 2026 re-review)', () => {
+  it("a site can't abort a build serve didn't make for it, even with no other site involved", async () => {
+    const { post, fake } = await setup();
+    const other = (await fake.call('createAction', pay(1000, { noSend: true }))) as { txid: string };
+    const r = await post('abortAction', { reference: other.txid });
+    expect(r.status).toBe(400);
+    expect(String(r.body.message)).toMatch(/brc100 abort/);
+    expect(fake.aborted.size).toBe(0);
+  });
+});
+
+describe('a signAction flow counts once toward the rate limit (13 Nov 2026 re-review)', () => {
+  const spends = (account: string) => readLog(account).filter((e) => /^(send|buy|sell|list|failed|paper-)/.test(e.action));
+  it('outputs counted at createAction: signAction logs its fee without counting again', async () => {
+    const { post, account } = await setup();
+    const c = await post('createAction', pay(1000, { signAndProcess: false }));
+    const s = await post('signAction', { reference: (c.body.signableTransaction as { reference: string }).reference, spends: {} });
+    expect(s.status).toBe(200);
+    expect(readLog(account).map((e) => e.action)).toEqual(['send', 'brc100-signAction']);
+    expect(spends(account)).toHaveLength(1);
+    expect(readLog(account)[1].usd).toBeGreaterThan(0); // the fee still counts toward the daily cap
+  });
+
+  it('a 0-sat signable createAction is not counted; its signAction (the fee) is, once', async () => {
+    const { post, account } = await setup();
+    const c = await post('createAction', { description: 'sign flow data', outputs: [{ lockingScript: '006a04deadbeef', satoshis: 0, outputDescription: 'data blob' }], options: { signAndProcess: false } });
+    await post('signAction', { reference: (c.body.signableTransaction as { reference: string }).reference, spends: {} });
+    expect(readLog(account).map((e) => e.action)).toEqual(['sign', 'send']);
+    expect(spends(account)).toHaveLength(1);
+  });
+});
+
+describe('PIN level in the version (13 Nov 2026 re-review)', () => {
+  it('reads `; pin=N;`, the legacy `+pN` and a pinnedProtocols field; caps the version at 30 bytes', () => {
+    expect(pinLevelOf({ version: 'bwalletx-5.3.0; pin=3;' })).toBe(3);
+    expect(pinLevelOf({ version: 'bwalletx-5.2.44+p2' })).toBe(2);
+    expect(pinLevelOf({ version: 'wallet-brc100-1.0.0', pinnedProtocols: 4 })).toBe(4);
+    expect(pinLevelOf('wallet-brc100-1.0.0')).toBe(0);
+    expect(versionWithPin('bwalletx-serve-0.6.1', 3)).toBe('bwalletx-serve-0.6.1; pin=3;');
+    expect(versionWithPin('bwalletx-serve-0.6.1', 0)).toBe('bwalletx-serve-0.6.1');
+    expect(versionWithPin('bwalletx-serve-10.10.10', 123)).toBe('bwalletx-serve-10.10.10'); // would pass 30 bytes
   });
 });

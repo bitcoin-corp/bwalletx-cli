@@ -11,7 +11,7 @@ import { createRequire } from 'node:module';
 
 const dir = mkdtempSync(join(tmpdir(), 'bwx-review-'));
 process.env.BWALLETX_HOME = dir;
-const { writeConfig } = await import('./store');
+const { writeConfig, readLog } = await import('./store');
 const { serve } = await import('./brc100');
 const { issueToken } = await import('./servePairing');
 const require = createRequire(import.meta.url);
@@ -56,7 +56,7 @@ function mockServices() {
   });
 }
 
-async function makeWallet() {
+async function makeWallet(mode?: 'legacy') {
   const root = PrivateKey.fromRandom();
   const kd = new KeyDeriver(root);
   const storage = new toolbox.WalletStorageManager(kd.identityKey);
@@ -66,7 +66,7 @@ async function makeWallet() {
   await active.migrate('review', kd.identityKey);
   await active.makeAvailable();
   await storage.addWalletStorageProvider(active);
-  const wallet = new toolbox.Wallet({ chain: 'main', keyDeriver: kd, storage, services });
+  const wallet = new toolbox.Wallet({ chain: 'main', keyDeriver: kd, storage, services, ...(mode && { actionBatchMode: mode }) });
   // Fund: a proven tx paying a BRC-29 wallet payment output, internalized.
   const derivationPrefix = Utils.toBase64(Utils.toArray('prefix01', 'utf8'));
   const derivationSuffix = Utils.toBase64(Utils.toArray('suffix01', 'utf8'));
@@ -89,12 +89,21 @@ async function makeWallet() {
 }
 
 let acct = 0;
-async function setup(origins = ['shop.example'], caps: Record<string, number> = { maxUsdPerAction: 100, sessionBudgetUsd: 1000 }) {
+const ctl = { throwOnSend: false };
+async function setup(origins = ['shop.example'], caps: Record<string, number> = { maxUsdPerAction: 100, sessionBudgetUsd: 1000 }, mode?: 'legacy') {
   const account = `r${++acct}`;
   writeConfig({ accounts: { [account]: { name: account, kind: 'paired', identityAddress: '1x', payAddress: '', ordAddress: '', dailyCapUsd: null, stopped: false, importedAt: Date.now() } }, defaultAccount: account } as never);
-  const { wallet, knex } = await makeWallet();
+  const { wallet, knex } = await makeWallet(mode);
   const api = wallet as unknown as Record<string, (a: unknown, o?: string) => Promise<unknown>>;
-  const w = { paired: false, call: (m: string, a: unknown, site: string) => api[m](a, site), owned: async () => new Set<string>(), close: async () => undefined };
+  const call = async (m: string, a: any, site: string) => {
+    // Test control: the next send step (a sendWith-only createAction) fails as if storage threw.
+    if (ctl.throwOnSend && m === 'createAction' && a?.options?.sendWith?.length && !a.outputs?.length) {
+      ctl.throwOnSend = false;
+      throw new Error('simulated storage failure on send');
+    }
+    return api[m](a, site);
+  };
+  const w = { paired: false, call, owned: async () => new Set<string>(), close: async () => undefined };
   const relayed: string[] = [];
   const events: string[] = [];
   const server = await serve(w, { account, origins, port: 0, arc: async (r) => void relayed.push(r.txid), usdPerBsv: async () => 50, onEvent: (l) => events.push(l), ...caps });
@@ -105,7 +114,7 @@ async function setup(origins = ['shop.example'], caps: Record<string, number> = 
   };
   const settle = () => new Promise((r) => setTimeout(r, 50));
   const status = async (txid: string) => ((await knex('transactions').where({ txid }).first()) as { status?: string } | undefined)?.status;
-  return { post, relayed, settle, server, wallet, knex, events, status };
+  return { post, relayed, settle, server, wallet, knex, events, status, account };
 }
 const dest = new P2PKH().lock(PrivateKey.fromRandom().toAddress()).toHex();
 const pay = (sats: number, options: Record<string, unknown> = {}) => ({ description: 'review payment', outputs: [{ lockingScript: dest, satoshis: sats, outputDescription: 'pay the shop' }], options });
@@ -241,3 +250,68 @@ describe('serve over the real toolbox', () => {
     expect([...unknownCalls]).toEqual([]);
   });
 });
+
+for (const mode of [undefined, 'legacy'] as const) {
+  describe(`13 Nov 2026 re-review, ${mode ?? 'action-batch'} mode`, () => {
+    const parentsOf = async (wallet: any) => [...new Set(((await wallet.listOutputs({ basket: 'default', limit: 100 })) as { outputs: { outpoint: string }[] }).outputs.map((o) => o.outpoint.split('.')[0]))];
+
+    it('knownTxids naming the wallet\'s parents: paid, priced, and the reply BEEF trimmed to them', async () => {
+      const s = await setup(undefined, undefined, mode);
+      const parents = await parentsOf(s.wallet);
+      const r = await s.post('createAction', pay(1000, { knownTxids: parents }));
+      expect(r.status, JSON.stringify(r.body)).toBe(200);
+      const beef = Beef.fromBinary(r.body.tx);
+      for (const t of parents) if (beef.findTxid(t)) expect(beef.findTxid(t).isTxidOnly).toBe(true);
+      expect(beef.findTxid(r.body.txid).isTxidOnly).toBe(false);
+      await s.settle();
+      expect(s.relayed).toEqual([r.body.txid]);
+      s.server.close();
+    });
+
+    it('knownTxids on a noSend build, then sendWith', async () => {
+      const s = await setup(undefined, undefined, mode);
+      const a = await s.post('createAction', pay(1000));
+      const b = await s.post('createAction', pay(1000, { noSend: true, knownTxids: [a.body.txid, ...(await parentsOf(s.wallet))] }));
+      expect(b.status, JSON.stringify(b.body)).toBe(200);
+      const c = await s.post('createAction', { description: 'send the build', options: { sendWith: [b.body.txid] } });
+      expect(c.status, JSON.stringify(c.body)).toBe(200);
+      await s.settle();
+      expect(s.relayed).toEqual([a.body.txid, b.body.txid]);
+      s.server.close();
+    });
+
+    it('the send step fails: serve aborts the build, the coins come back, the site gets the txid', async () => {
+      const s = await setup(undefined, undefined, mode);
+      const before = await balance(s.wallet);
+      ctl.throwOnSend = true;
+      const r = await s.post('createAction', pay(100_000));
+      expect(r.status).toBe(400);
+      expect(r.body.aborted, JSON.stringify(r.body)).toBe(true);
+      expect(typeof r.body.txid).toBe('string');
+      expect(await balance(s.wallet)).toBe(before);
+      await s.settle();
+      expect(s.relayed).toEqual([]);
+      s.server.close();
+    });
+
+    it("a site can't abort another app's noSend build (owner unknown)", async () => {
+      const s = await setup(undefined, undefined, mode);
+      const other = (await s.wallet.createAction({ description: 'another app build', outputs: [{ lockingScript: dest, satoshis: 1000, outputDescription: 'other app pay' }], options: { noSend: true } }, 'other.app')) as { txid: string };
+      const ab = await s.post('abortAction', { reference: other.txid });
+      expect(ab.status).toBe(400);
+      // Still the other app's to send.
+      const sent = (await s.wallet.createAction({ description: 'other app sends', options: { sendWith: [other.txid] } }, 'other.app')) as { sendWithResults: { status: string }[] };
+      expect(sent.sendWithResults[0].status).not.toBe('failed');
+      s.server.close();
+    });
+
+    it('a signAction flow counts once toward the rate limit', async () => {
+      const s = await setup(undefined, undefined, mode);
+      const c = await s.post('createAction', pay(1000, { signAndProcess: false }));
+      const sg = await s.post('signAction', { reference: c.body.signableTransaction.reference, spends: {} });
+      expect(sg.status, JSON.stringify(sg.body)).toBe(200);
+      expect(readLog(s.account).map((e: { action: string }) => e.action)).toEqual(['send', 'brc100-signAction']);
+      s.server.close();
+    });
+  });
+}

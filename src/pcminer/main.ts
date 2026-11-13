@@ -51,8 +51,14 @@ const openBrowser = (url: string) => {
 };
 
 async function main() {
-  // The worker is the build's second entry point: dist layout pcminer/main.js + opns/minerWorker.js.
-  if (process.versions.bun) (await import('../opns/miner.js')).setWorkerUrl(new URL('../opns/minerWorker.js', import.meta.url));
+  // The worker is the build's second entry point. In the compiled binary the entry runs as /$bunfs/root/<exe name>
+  // (B:/~BUN/root/ on Windows) and the worker sits at <root>/opns/minerWorker.js, so '../opns/…' from import.meta.url
+  // pointed outside the bundle and every worker failed (the bench showed 0.0 MH/s). Bun resolves a relative worker
+  // path against the bundle root. From source (bun run src/pcminer/main.ts) the file layout applies.
+  if (process.versions.bun) {
+    const compiled = /\$bunfs|~BUN/.test(import.meta.url);
+    (await import('../opns/miner.js')).setWorkerUrl(compiled ? './opns/minerWorker.js' : new URL('../opns/minerWorker.js', import.meta.url));
+  }
   if (args.includes('--bench')) {
     const { benchmark } = await import('../opns/miner.js');
     const r = await benchmark(5);

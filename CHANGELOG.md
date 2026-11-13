@@ -27,8 +27,23 @@ A money fix for `serve`. If an app uses noSend through `bwalletx serve`, or site
   signed in or not. In paired mode it adds the phone's PIN level, `bwalletx-serve-0.6.1; pin=N;`. Older serves
   answered `bwalletx-1.0.0` before pairing and the wallet's own `wallet-brc100-1.0.0` after. A client that relies
   on noSend should refuse anything that isn't `bwalletx-serve-` 0.6.1 or later.
+- **A failed send leaves nothing locked.** If sending fails after every check passed, serve aborts the build
+  (the wallet only allows that while the tx is still unsent and unknown to the network): nothing is paid and the
+  coins come back. If the wallet refuses the abort, the payment may be out: it stays counted and logged. Either
+  way the error names the txid (`txid`, `aborted` in the reply), so a site can check before paying again.
+- **A site can only abort its own builds** from this serve session. An unknown action may be another app's held
+  build, so it is refused. After a serve restart the owner frees a leftover with the new
+  `bwalletx brc100 abort <txid>`.
+- **`knownTxids` works again through serve.** serve builds with the full BEEF (it needs the parents to price the
+  fee, and the toolbox's batch planner failed on noSend + knownTxids), then trims the reply to what the site
+  declared.
+- **A signAction flow counts once** toward the hourly rate limit (its fee still counts toward the daily cap).
 - The account log marks a noSend build "(noSend: built, not sent)" and shows each payment's fee.
-- The bNamesX PC miner no longer crashes at start: serve's version is read lazily, with a built-in fallback.
+- **Paired `getVersion` answers at once** from a cached PIN level (refreshed in the background every 5 minutes;
+  the first call waits at most 1 s), reads the legacy `+pN` suffix too, and never passes 30 bytes.
+- **The bNamesX PC miner** no longer crashes at start (serve's version is read lazily, with a built-in
+  fallback), and the compiled miner mines again: its worker path pointed outside the bundle, so every worker failed
+  and the benchmark showed 0.0 MH/s (now ~7.6 MH/s on an M-series Mac).
 
 ### Known gaps (ARC nudge only)
 

@@ -131,19 +131,29 @@ describe('serve --wallet paired', () => {
     expect(arcCalls).toEqual([]);
   });
 
-  it("answers getVersion as serve's version plus the phone's PIN level", async () => {
+  it("answers getVersion as serve's version plus the phone's PIN level, asking the phone once (cached)", async () => {
     const { post, fake } = await setup('answer');
     const r = await post('getVersion', {});
     expect(r.status).toBe(200);
     expect(r.body.version).toBe(`${serveVersion()}; pin=2;`);
-    expect(String(r.body.version).length).toBeLessThan(30);
+    expect(String(r.body.version).length).toBeLessThanOrEqual(30);
+    expect((await post('getVersion', {})).body.version).toBe(`${serveVersion()}; pin=2;`);
     expect(fake.seen.map((s) => s.method)).toEqual(['getVersion']);
+  });
+
+  it("answers getVersion fast when the phone doesn't (busy with a prompt): plain serve version within ~1 s", async () => {
+    const { post } = await setup('silent');
+    const t0 = Date.now();
+    const r = await post('getVersion', {});
+    expect(Date.now() - t0).toBeLessThan(1_800);
+    expect(r.body.version).toBe(serveVersion());
   });
 
   it('getVersion without a PIN level from the phone (or no phone) is the plain serve version', () => {
     expect(pairedVersion('wallet-brc100-1.0.0')).toBe(serveVersion());
     expect(pairedVersion(undefined)).toBe(serveVersion());
     expect(pairedVersion('x; pin=4;')).toBe(`${serveVersion()}; pin=4;`);
+    expect(pairedVersion({ version: 'bwalletx-5.2.44+p3' })).toBe(`${serveVersion()}; pin=3;`);
   });
 
   it('refuses disallowed origins locally', async () => {

@@ -536,6 +536,23 @@ brc
     }),
   );
 brc
+  .command('abort <txid>')
+  .description("abort a held (noSend) action so its coins come back, e.g. one a site left behind before serve restarted; the wallet refuses if the network already has it")
+  .option('-a, --account <name>', 'agent account')
+  .option('--shared', "use the account's 1Sat Storage wallet (only if the app uses it as active storage)")
+  .action(
+    run(async (txid: string, o: { account?: string; shared?: boolean }) => {
+      const { name, w } = await brc100Account(o.account, o.shared);
+      try {
+        const r = await w.wallet.abortAction({ reference: txid }, 'bwalletx-cli');
+        appendLog(name, { at: Date.now(), action: 'brc100-abort', detail: `aborted held action ${txid}`, usd: 0 });
+        print(r, () => `Aborted ${txid}: nothing was sent and its coins are back in the wallet.`);
+      } finally {
+        await w.close();
+      }
+    }),
+  );
+brc
   .command('withdraw <usd> <address>')
   .description('send BSV worth <usd> dollars ("all" for everything) from the BRC-100 wallet to an address')
   .option('-a, --account <name>', 'agent account')
