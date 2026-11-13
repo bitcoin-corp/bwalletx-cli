@@ -54,24 +54,41 @@ export async function banner(out: (s: string) => void = (s) => process.stdout.wr
 }
 
 /**
- * The pairing QR for a terminal, small, the way qr-cli (github.com/asharahmed/qr-cli, render.ts renderSmall) and Expo
- * draw it (owner, 13 Nov 2026): two module rows per text row with half-blocks, no colours. Dark modules are the
- * terminal's text colour and light ones its background, so on a dark terminal the code is light-on-dark; phone
- * scanners read that (bWalletX's scanner tries both ways since 5.2.56). A 2-module quiet zone.
+ * The pairing QR for a terminal (owner, 13 Nov 2026: it must scan in the CLI, and not be huge).
+ * - `small` (the default): qr-cli / Expo style, two module rows per text row with half-blocks and no colours, so it
+ *   is light-on-dark on a dark terminal (bWalletX's scanner tries both ways since 5.2.56).
+ * - `solid`: one module per character, black and white background colours. Half-blocks break where a terminal adds
+ *   space between lines and draws block glyphs from the font (VS Code with GPU acceleration off centres each line,
+ *   leaving a gap above and below that no scanner reads through); a cell's background fills that space. It is as
+ *   tall as the code but only as wide, and phones read the tall modules fine. VS Code gets it by default.
  */
-export const terminalQr = (modules: { size: number; get(r: number, c: number): number | boolean }, border = 2) => {
+export type QrStyle = 'small' | 'solid';
+export const defaultQrStyle = (): QrStyle => (process.env.TERM_PROGRAM === 'vscode' ? 'solid' : 'small');
+export const terminalQr = (
+  modules: { size: number; get(r: number, c: number): number | boolean },
+  style: QrStyle = defaultQrStyle(),
+  border = 2,
+) => {
   const n = modules.size + border * 2;
   const dark = (r: number, c: number) =>
     r >= border && c >= border && r < n - border && c < n - border && !!modules.get(r - border, c - border);
   const lines: string[] = [];
-  for (let r = 0; r < n; r += 2) {
-    let l = '';
-    for (let c = 0; c < n; c++) {
-      const top = dark(r, c);
-      const bottom = r + 1 < n && dark(r + 1, c);
-      l += top && bottom ? '█' : top ? '▀' : bottom ? '▄' : ' ';
+  if (style === 'solid') {
+    for (let r = 0; r < n; r++) {
+      let l = '';
+      for (let c = 0; c < n; c++) l += dark(r, c) ? '\x1b[48;2;0;0;0m ' : '\x1b[48;2;255;255;255m ';
+      lines.push(l + '\x1b[0m');
     }
-    lines.push(l);
+  } else {
+    for (let r = 0; r < n; r += 2) {
+      let l = '';
+      for (let c = 0; c < n; c++) {
+        const top = dark(r, c);
+        const bottom = r + 1 < n && dark(r + 1, c);
+        l += top && bottom ? '█' : top ? '▀' : bottom ? '▄' : ' ';
+      }
+      lines.push(l);
+    }
   }
   const title = ' bWalletX · scan to pair ';
   return [yellow(' '.repeat(Math.max(0, Math.floor((n - title.length) / 2))) + title), ...lines].join('\n') + '\n';

@@ -9,7 +9,7 @@
  */
 import { PrivateKey } from '@bsv/sdk';
 import QRCode from 'qrcode';
-import { terminalQr, yellow } from './brand.js';
+import { terminalQr, yellow, type QrStyle } from './brand.js';
 import WebSocket from 'ws';
 import { existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -79,6 +79,8 @@ export type LoginOptions = {
   openQr?: boolean;
   /** QR the full pairing link instead of the compact code (wallets older than 5.2.56 read only the full link). */
   fullQr?: boolean;
+  /** How to draw the terminal QR (brand.ts terminalQr). Default: solid in VS Code, small elsewhere. */
+  qrStyle?: QrStyle;
 };
 export type MintInfo = { maxItems: number; maxUsd: number; itemsUsed: number; spentUsd: number; itemsLeft: number; usdLeft: number };
 
@@ -157,14 +159,14 @@ export async function login(name: string, opts: LoginOptions, out: (s: string) =
     throw new Error('login needs opts.confirmCode: ask whether the phone shows the same code');
   const deadline = Date.now() + 5 * 60_000;
   while (Date.now() < deadline) {
-    const r = await round(name, opts.mode ?? 'agent', out, opts.confirmCode, opts.relay ?? DEFAULT_RELAY, opts.openQr, opts.fullQr);
+    const r = await round(name, opts.mode ?? 'agent', out, opts.confirmCode, opts.relay ?? DEFAULT_RELAY, opts.openQr, opts.fullQr, opts.qrStyle);
     if (r) return r;
     out('\nThe code expired; here is a new one.\n');
   }
   throw new Error('Pairing timed out. Run `bwalletx login` again.');
 }
 
-function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void, confirmCode: LoginOptions['confirmCode'] | undefined, relay: string, openQr = false, fullQr = false): Promise<Pairing | null> {
+function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void, confirmCode: LoginOptions['confirmCode'] | undefined, relay: string, openQr = false, fullQr = false, qrStyle?: QrStyle): Promise<Pairing | null> {
   const S = PrivateKey.fromRandom();
   const c = newChannel();
   const e = Math.floor(Date.now() / 1000) + QR_LIFETIME_S;
@@ -182,7 +184,7 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void,
     ws.on('open', async () => {
       // The compact code implies the default relay, so a test relay gets the full link.
       const qr = fullQr || relay !== DEFAULT_RELAY ? link : compactPairCode(c, S.toPublicKey().toString());
-      out(terminalQr(QRCode.create(qr, { errorCorrectionLevel: 'L' }).modules));
+      out(terminalQr(QRCode.create(qr, { errorCorrectionLevel: 'L' }).modules, qrStyle));
       if (openQr) await showQrImage(qr, out);
       out(
         yellow(

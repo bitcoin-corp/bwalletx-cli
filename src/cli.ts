@@ -49,12 +49,13 @@ program
   .option('-a, --account <name>', 'local name for this paired account', 'phone')
   .option('--open-qr', 'also open the QR as an image (for terminals whose fonts break the text QR)')
   .option('--full-qr', 'QR the full pairing link (bWalletX older than 5.2.56 reads only that)')
+  .option('--qr <style>', 'how to draw the QR: small (half-blocks) or solid (one module per character; for terminals that space lines apart)')
   .action(
-    run(async (o: { account: string; openQr?: boolean; fullQr?: boolean }) => {
+    run(async (o: { account: string; openQr?: boolean; fullQr?: boolean; qr?: string }) => {
       needTerminal();
       const owner = await og.requireOwner(`pair a phone account as "${o.account}"`);
       if (!asJson) await banner();
-      const p = await login(o.account, { confirmCode: askCode, openQr: o.openQr, fullQr: o.fullQr });
+      const p = await login(o.account, { confirmCode: askCode, openQr: o.openQr, fullQr: o.fullQr, qrStyle: o.qr === 'small' || o.qr === 'solid' ? o.qr : undefined });
       og.approveNewAccount(owner, p.name);
       console.log(`\nPaired "${p.name}" with ${p.account}: ${p.scopes.join(', ')} until ${new Date(p.expiresAt).toLocaleDateString()}.`);
       console.log('Keep bWalletX open on that account while the CLI works. Try: bwalletx balance --account ' + p.name);
