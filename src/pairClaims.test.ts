@@ -80,10 +80,13 @@ describe('CLI site sockets', () => {
     expect(u.searchParams.get('nc')).toBeNull();
   });
 
-  it("a v1 pairing becomes v2 when the phone's sealed ready says wcv 2 (it upgraded on resume)", () => {
-    expect(learnsWalletClaimV2(pairing(), { t: 'ready', wcv: 2 })).toBe(true);
+  it("a v1 pairing becomes v2 when the phone's sealed ready names the session claim we derive", () => {
+    const nc = claimDigest(SESSION_VECTOR);
+    expect(learnsWalletClaimV2(pairing(), { t: 'ready', wcv: 2, nc })).toBe(true);
+    expect(learnsWalletClaimV2(pairing(), { t: 'ready', wcv: 2 })).toBe(false);
+    expect(learnsWalletClaimV2(pairing(), { t: 'ready', wcv: 2, nc: 'f'.repeat(64) })).toBe(false);
     expect(learnsWalletClaimV2(pairing(), { t: 'ready' })).toBe(false);
-    expect(learnsWalletClaimV2(pairing({ wv: 2 }), { t: 'ready', wcv: 2 })).toBe(false);
+    expect(learnsWalletClaimV2(pairing({ wv: 2 }), { t: 'ready', wcv: 2, nc })).toBe(false);
     expect(learnsWalletClaimV2(pairing(), { t: 'ping' })).toBe(false);
   });
 });

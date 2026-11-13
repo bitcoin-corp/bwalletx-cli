@@ -66,11 +66,11 @@ export type Brc100Caps = { dailyUsd?: number; perCallUsd?: number; origins?: str
 export type LoginOptions = {
   mode?: 'agent' | 'brc100';
   /**
-   * Ask whether the phone shows the same code; true only on a yes. With it, nothing is saved until the phone's Pair
+   * Required. Ask whether the phone shows the same code; true only on a yes. Nothing is saved until the phone's Pair
    * AND a yes; a no tells the phone to unpair. Whoever joins the QR's channel first gets it, so a stranger who used
    * the QR first shows a different code (and the user's phone says the code was already used).
    */
-  confirmCode?: (code: string) => Promise<boolean>;
+  confirmCode: (code: string) => Promise<boolean>;
   /** Relay host. Default relay.bwallet.space (tests use a local one). */
   relay?: string;
 };
@@ -108,11 +108,16 @@ export function pairedSiteUrl(p: Pairing, expiry: number, save: (p: Pairing) => 
 }
 
 /**
- * A sealed `ready` saying wcv 2 on a pairing saved as v1: the phone upgraded on a resume and its relay now holds the
- * session claim, so from now on we re-bind it on connect (pairedSiteUrl). Exported for tests.
+ * A sealed `ready` naming the phone's session claim (`wcv: 2`, `nc` = its digest) on a pairing not yet v2. True only
+ * when `nc` matches the claim we derive from our key and the phone's; we then re-bind the phone's role to it on our
+ * next connect (pairedSiteUrl), which is how a pairing that started as v1 upgrades. Exported for tests.
  */
-export const learnsWalletClaimV2 = (p: Pick<Pairing, 'wv'>, msg: PairMessage) =>
-  msg.t === 'ready' && msg.wcv === 2 && p.wv !== 2;
+export const learnsWalletClaimV2 = (p: Pick<Pairing, 'wv' | 's' | 'k' | 'c'>, msg: PairMessage) =>
+  msg.t === 'ready' &&
+  msg.wcv === 2 &&
+  p.wv !== 2 &&
+  typeof msg.nc === 'string' &&
+  msg.nc === claimDigest(sessionWalletClaim(PrivateKey.fromHex(p.s), p.k, p.c));
 
 /** The site socket URL for a new pairing: our site claim, and the digest of the claim only the QR gives (`wc`). */
 export function newChannelUrl(relay: string, c: string, sitePub: string, expiry: number, sc: string): string {
@@ -120,8 +125,11 @@ export function newChannelUrl(relay: string, c: string, sitePub: string, expiry:
 }
 
 /** `bwalletx login`: show a QR, wait for the phone, save the pairing as account `name`. */
-export async function login(name: string, opts: LoginOptions = {}, out: (s: string) => void = console.log): Promise<Pairing> {
+export async function login(name: string, opts: LoginOptions, out: (s: string) => void = console.log): Promise<Pairing> {
   if (!/^[A-Za-z0-9._-]{1,40}$/.test(name) || name.startsWith('.')) throw new Error(`Bad account name "${name}"`);
+  // The code check is what stops someone who saw the QR first, so a pairing never finishes on the phone's Pair alone.
+  if (typeof opts?.confirmCode !== 'function')
+    throw new Error('login needs opts.confirmCode: ask whether the phone shows the same code');
   const deadline = Date.now() + 5 * 60_000;
   while (Date.now() < deadline) {
     const r = await round(name, opts.mode ?? 'agent', out, opts.confirmCode, opts.relay ?? DEFAULT_RELAY);
@@ -131,7 +139,7 @@ export async function login(name: string, opts: LoginOptions = {}, out: (s: stri
   throw new Error('Pairing timed out. Run `bwalletx login` again.');
 }
 
-function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void, confirmCode: LoginOptions['confirmCode'], relay: string): Promise<Pairing | null> {
+function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void, confirmCode: LoginOptions['confirmCode'] | undefined, relay: string): Promise<Pairing | null> {
   const S = PrivateKey.fromRandom();
   const c = newChannel();
   const e = Math.floor(Date.now() / 1000) + QR_LIFETIME_S;
@@ -194,6 +202,8 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void,
       if (msg.t === 'ready') {
         if (answer && !(await answer)) return; // a no unpairs the phone and rejects (above)
         if (done) return;
+        // The phone's ready names its session claim (wallet claim v2) even when the relay didn't bind it yet.
+        if (!v2 && learnsWalletClaimV2({ s: S.toHex(), k: phoneKey, c }, msg)) v2 = true;
         infoId = `info-${Date.now()}`;
         ws.send(JSON.stringify(await sealer.seal({ t: 'req', id: infoId, action: 'info', params: mode === 'brc100' ? { mode } : {} })));
       } else if (msg.t === 'res' && infoId && msg.id === infoId) {

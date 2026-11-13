@@ -92,6 +92,13 @@ function run(name: string, confirmCode: (code: string) => Promise<boolean>, evil
 const saved = (name: string) => existsSync(join(dir, 'paired', `${name}.json`));
 
 describe('login confirms the code', () => {
+  it('without confirmCode it refuses before showing a QR', async () => {
+    const lines: string[] = [];
+    await expect(login('noask', { relay: relay.host } as never, (s) => lines.push(s))).rejects.toThrow(/confirmCode/);
+    expect(lines).toEqual([]);
+    expect(saved('noask')).toBe(false);
+  });
+
   it('a yes pairs, asked with the code the phone shows', async () => {
     const asked: string[] = [];
     const { p, phone } = run('yes', async (c) => (asked.push(c), true));
