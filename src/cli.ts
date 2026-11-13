@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import './quiet.js';
 import { banner } from './brand.js';
 import { readFileSync } from 'node:fs';
 import { Command } from 'commander';
