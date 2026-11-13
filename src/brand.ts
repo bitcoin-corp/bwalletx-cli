@@ -35,11 +35,15 @@ const frame = (at: number) =>
 
 /** Prints the banner; on a terminal a light band sweeps across it once (~0.7 s). */
 export async function banner(out: (s: string) => void = (s) => process.stdout.write(s)) {
-  if (!tty()) {
-    out(ART.join('\n') + '\n');
+  const width = Math.max(...ART.map((l) => l.length));
+  // The animation moves the cursor back up ART.length lines; in a window narrower than the art the lines wrap, the
+  // count is wrong and the frames smear over everything after (the pairing QR included). Animate only when it fits.
+  const fits = (process.stdout.columns ?? 0) > width;
+  if (!tty() || !fits) {
+    if (fits || !tty()) out(ART.join('\n') + '\n');
+    else out(yellow('bWalletX') + '\n');
     return;
   }
-  const width = Math.max(...ART.map((l) => l.length));
   out('\x1b[?25l'); // hide cursor
   for (let at = -6; at <= width + 6; at += 3) {
     out(frame(at) + '\n');
