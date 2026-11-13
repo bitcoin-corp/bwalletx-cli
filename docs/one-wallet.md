@@ -48,7 +48,7 @@ Moving funds from the CLI's own wallet into the main wallet is not part of this 
   `privileged: true`.
 - `createAction` passes the local gate (kill switch, daily cap, rate limit, strategy) first.
 - No ARC relay in paired mode: the phone broadcasts what it signs.
-- `getVersion` is answered by serve itself (`bwalletx-serve-<version>`), not the phone.
+- `getVersion` is answered by serve (`bwalletx-serve-<version>; pin=N;`), with the PIN level read from the phone.
 
 ### Wire format
 

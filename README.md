@@ -137,7 +137,7 @@ find it the same way they find BSV Desktop. Built on `@bsv/wallet-toolbox`; keys
   carry `Authorization: Bearer <token>`; without a valid token for that origin it gets 401. Only `getVersion` and
   `isAuthenticated` answer unpaired (serve's version and `authenticated: false`), so sites can detect the
   wallet. `getVersion` is always answered by serve itself, `bwalletx-serve-<version>` (0.6.1 or later never
-  relays a noSend build). Tokens are random per origin and stored only as SHA-256 hashes in `~/.bwalletx/serve-pairings.json`
+  relays a noSend build); in paired mode it adds the phone's PIN level, `; pin=N;`. Tokens are random per origin and stored only as SHA-256 hashes in `~/.bwalletx/serve-pairings.json`
   (0600). `bwalletx serve --list-pairings` lists them; `bwalletx serve --revoke <origin>` revokes one at once.
   Serve without a terminal (no TTY) refuses every pairing request.
 - **Host check**: serve binds to 127.0.0.1 and answers 403 unless the `Host` header is `localhost:<port>` or
@@ -148,9 +148,13 @@ find it the same way they find BSV Desktop. Built on `@bsv/wallet-toolbox`; keys
 - **Log**: every spend and signature lands in the activity log with the site and txid.
 - **noSend is respected**: serve also hands what the wallet sends to ARC, but only the txids the wallet itself
   sent or queued. A `createAction`/`signAction` with `options.noSend` is returned signed and is not broadcast;
-  the later `createAction { options: { sendWith: [txid…] } }` sends it (or `abortAction` drops it). The caps
-  count the build, not the `sendWith` call, and an abort gives nothing back (the site already holds the signed
-  tx).
+  the later `createAction { options: { sendWith: [txid…] } }` sends it (or `abortAction` drops it). A site can
+  only `sendWith`, chain on (`noSendChange`), sign or abort builds it made itself in this serve session; a build
+  from before a serve restart can't be sent this way (abort it and build again). The caps count the build, not
+  the `sendWith` call, and an abort gives nothing back (the site already holds the signed tx).
+- **Fees count**: every build is made noSend first and priced from the signed tx. Its network fee counts toward
+  the caps below and the daily cap, and must be at most `--max-fee-sats` (default 10,000). A refused build is
+  aborted; an accepted one is then sent (unless the site asked for noSend).
 - **Limits**: one payment from a site may move at most `--max-usd` (default $1) and the session at most
   `--budget-usd` (default $5).
 - **Tokens**: the caps value satoshis only, and a BSV-21 token output is 1 sat however much the token is

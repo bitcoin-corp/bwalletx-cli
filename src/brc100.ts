@@ -8,7 +8,9 @@
  * wallet (BSV Desktop / Metanet), so any such site can use the agent account. Guard rails:
  *   - only origins on the allowlist get an answer;
  *   - every createAction passes the same gate as `send` (kill switch, daily cap, rate limit,
- *     loaded strategy) for the BSV it would take out of the account;
+ *     loaded strategy) for the BSV it would take out of the account, network fee included (local
+ *     mode builds noSend first, prices the signed tx, then sends it);
+ *   - a site can only send, chain on or abort the noSend builds it made in this serve session;
  *   - every call that spends or signs is logged to ~/.bwalletx/log/<account>.jsonl.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -320,9 +322,53 @@ export function txidsToRelay(out: unknown, o: { noSend: boolean }): string[] {
   return subject && uniq.includes(subject) ? [...uniq.filter((t) => t !== subject), subject] : uniq;
 }
 
-/** What `getVersion` answers from serve, in every mode, paired or not. 0.6.1+ never relays a noSend build. */
-const PKG_VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
-export const SERVE_VERSION = `bwalletx-serve-${PKG_VERSION}`;
+/**
+ * The package version, read lazily: the Bun-compiled bNamesX PC miner has no package.json beside it, and reading it
+ * at import crashed the miner ('/$bunfs/package.json' ENOENT). Falls back to this constant; a test keeps them equal.
+ */
+export const VERSION_FALLBACK = '0.6.1';
+let serveVersionCache: string | undefined;
+/** What `getVersion` answers from serve. 0.6.1+ never relays a noSend build and only sends a site's own builds. */
+export function serveVersion(): string {
+  if (serveVersionCache) return serveVersionCache;
+  let v = VERSION_FALLBACK;
+  try {
+    const p = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: unknown };
+    if (typeof p.version === 'string' && p.version) v = p.version;
+  } catch {
+    // a compiled binary: no package.json
+  }
+  return (serveVersionCache = `bwalletx-serve-${v}`);
+}
+/** Paired mode: serve's version plus the phone's PIN level, which sites read as `pin=N`. */
+export const pairedVersion = (phoneVersion: unknown) => {
+  const m = /pin=(\d+)/.exec(String(phoneVersion ?? ''));
+  return m ? `${serveVersion()}; pin=${m[1]};` : serveVersion();
+};
+
+/** Network fee of a signed AtomicBEEF tx: what its inputs bring minus what its outputs carry. undefined if an input's value is unknown. */
+export function feeOf(tx: ArrayLike<number>, inputBEEF?: ArrayLike<number>): number | undefined {
+  let t: InstanceType<typeof sdk.Transaction>;
+  try {
+    t = sdk.Transaction.fromAtomicBEEF(Array.from(tx));
+  } catch {
+    return undefined;
+  }
+  let caller: InstanceType<typeof Beef> | undefined;
+  try {
+    if (inputBEEF?.length) caller = Beef.fromBinary(Array.from(inputBEEF));
+  } catch {
+    caller = undefined;
+  }
+  let ins = 0;
+  for (const i of t.inputs) {
+    let v = i.sourceTransaction?.outputs[i.sourceOutputIndex]?.satoshis;
+    if (v === undefined && i.sourceTXID) v = caller?.findTxid(i.sourceTXID)?.tx?.outputs[i.sourceOutputIndex]?.satoshis;
+    if (v === undefined) return undefined;
+    ins += v;
+  }
+  return ins - t.outputs.reduce((n, x) => n + (x.satoshis ?? 0), 0);
+}
 
 /** Calls a site may make. Everything else (privileged key linkage, certificates) is refused. */
 const ALLOWED = new Set([
@@ -445,6 +491,8 @@ export type ServeOptions = {
   maxUsdPerAction?: number;
   /** Most this serve session may move in total, in USD. Default SERVE_SESSION_BUDGET_USD. */
   sessionBudgetUsd?: number;
+  /** Most network fee one action may pay, in sats (local mode). Default SERVE_MAX_FEE_SATS. */
+  maxFeeSats?: number;
   /**
    * Let sites move tokens/ordinals: createActions with BSV-20/21 inscribed outputs or that name the
    * wallet's own outputs as inputs. Off by default: the caps value satoshis only, and a token output
@@ -476,6 +524,8 @@ export const hasTokenOutputs = (args: CreateActionArgs) =>
 export const namedOwnedInputs = (args: CreateActionArgs, owned: ReadonlySet<string>) =>
   (args.inputs ?? []).map((i) => i.outpoint).filter((op) => owned.has(op));
 export const SERVE_SESSION_BUDGET_USD = 5;
+/** Default most network fee per action: ~100 KB of data at the wallet's 100 sat/kB. A plain payment pays ~50. */
+export const SERVE_MAX_FEE_SATS = 10_000;
 
 /**
  * BRC-103/104 mutual-auth signatures and nonces. Keys are derived per counterparty, not per site, so an
@@ -503,56 +553,211 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
   const say = o.onEvent ?? (() => undefined);
   const arc = o.arc ?? relayToArc;
   const price = o.usdPerBsv ?? bsvUsd;
-  // noSend builds from this session (txid → AtomicBEEF), so a later sendWith can hand them to ARC; and the noSend
-  // option of each createAction waiting for signAction (the toolbox carries it over when signAction leaves it out).
-  const held = new Map<string, number[]>();
-  const signRefs = new Map<string, boolean>();
-  const remember = <V>(m: Map<string, V>, k: string, v: V) => {
-    m.delete(k);
-    m.set(k, v);
-    if (m.size > 500) m.delete(m.keys().next().value as string);
+  const maxFee = o.maxFeeSats ?? SERVE_MAX_FEE_SATS;
+
+  // Local mode bookkeeping (13 Nov 2026 review). The noSend builds each site made in this session: only that site
+  // may sendWith them, chain on their noSendChange or abort them. Their AtomicBEEF is kept for the ARC relay,
+  // capped in bytes (oldest dropped first: an evicted build can still be sent, it just gets no ARC nudge).
+  const owners = new Map<string, string>();
+  const beefs = new Map<string, Uint8Array>();
+  let beefBytes = 0;
+  const MAX_HELD = 10_000;
+  const MAX_BEEF_BYTES = 64 * 1024 * 1024;
+  type Pending = {
+    origin: string;
+    noSend: boolean;
+    sendWith: string[];
+    acceptDelayedBroadcast?: boolean;
+    returnTXIDOnly: boolean;
+    /** Sats the outputs take (counted at createAction) and the USD reserved for them then. */
+    sats: number;
+    usd: number;
+    description: string;
+    inputBEEF?: number[];
   };
-  const beefFor = (txid: string, out: ActionResult): number[] | undefined => {
-    if (out.txid === txid && out.tx?.length) return out.tx;
-    const h = held.get(txid);
-    if (h) return h;
-    if (!out.tx?.length) return undefined;
+  /** createActions waiting for signAction, by reference: whose they are and what the site asked for. */
+  const signRefs = new Map<string, Pending>();
+  const dropBeef = (txid: string) => {
+    const b = beefs.get(txid);
+    if (b) beefBytes -= b.length;
+    beefs.delete(txid);
+  };
+  const hold = (txid: string, origin: string, tx: ArrayLike<number>) => {
+    owners.delete(txid);
+    owners.set(txid, origin);
+    while (owners.size > MAX_HELD) {
+      const k = owners.keys().next().value as string;
+      owners.delete(k);
+      dropBeef(k);
+    }
+    dropBeef(txid);
+    const b = Uint8Array.from(tx);
+    if (b.length > MAX_BEEF_BYTES) return;
+    beefs.set(txid, b);
+    beefBytes += b.length;
+    while (beefBytes > MAX_BEEF_BYTES) dropBeef(beefs.keys().next().value as string);
+  };
+  const release = (txid: string) => {
+    owners.delete(txid);
+    dropBeef(txid);
+  };
+  const rememberRef = (ref: string, p: Pending) => {
+    signRefs.delete(ref);
+    signRefs.set(ref, p);
+    while (signRefs.size > 1_000) signRefs.delete(signRefs.keys().next().value as string);
+  };
+  const strings = (v: unknown) => (Array.isArray(v) ? v.map(String) : []);
+
+  const beefFor = (txid: string, subject: string | undefined, full: number[] | undefined): number[] | undefined => {
+    if (subject === txid && full?.length) return full;
+    const h = beefs.get(txid);
+    if (h) return Array.from(h);
+    if (!full?.length) return undefined;
     try {
-      return Beef.fromBinary(Array.from(out.tx)).findAtomicTransaction(txid)?.toAtomicBEEF(true);
+      return Beef.fromBinary(full).findAtomicTransaction(txid)?.toAtomicBEEF(true);
     } catch {
       return undefined;
     }
   };
-  /** After the CLI's own wallet built or signed: hold noSend builds, relay only what the wallet broadcast. */
-  const afterAction = (call: string, args: Record<string, unknown>, out: unknown, noSend: boolean) => {
-    const r = (out ?? {}) as ActionResult;
-    const ref = typeof args.reference === 'string' ? args.reference : undefined;
-    if (call === 'signAction' && ref) signRefs.delete(ref);
-    const pendingRef = r.signableTransaction?.reference;
-    if (call === 'createAction' && typeof pendingRef === 'string') remember(signRefs, pendingRef, noSend);
-    if (noSend && typeof r.txid === 'string' && r.tx?.length) remember(held, r.txid, Array.from(r.tx));
-    const ids = txidsToRelay(r, { noSend });
+  /** After the CLI's own wallet acted: relay only what the wallet itself sent or queued, never a noSend build. */
+  const relay = (out: ActionResult, noSend: boolean, full: number[] | undefined) => {
+    const ids = txidsToRelay({ ...out, tx: full }, { noSend });
     if (!ids.length) return;
-    const jobs = ids.map((txid) => ({ txid, tx: beefFor(txid, r) }));
+    const jobs = ids.map((txid) => ({ txid, tx: beefFor(txid, out.txid, full) }));
+    for (const j of jobs) release(j.txid); // sent: no longer held
     void (async () => {
       for (const j of jobs) {
         if (!j.tx) {
-          say(`${j.txid}: sent by the wallet; not built in this serve session, so no ARC relay`);
+          say(`${j.txid}: sent by the wallet; its BEEF isn't held any more, so no ARC relay`);
           continue;
         }
         await arc({ txid: j.txid, tx: j.tx }).catch(() => undefined);
-        held.delete(j.txid);
       }
     })();
   };
-  /** Would the wallet hold this tx back? createAction: its own option. signAction: its option, else the createAction's. */
-  const isNoSend = (call: string, args: Record<string, unknown>) => {
-    const ns = (args.options as { noSend?: unknown } | undefined)?.noSend;
-    if (call === 'createAction') return ns === true;
-    if (typeof ns === 'boolean') return ns;
+
+  /** Local mode: refuse what touches another site's builds, or builds serve doesn't know (13 Nov 2026 review). */
+  const localCheck = (call: string, args: Record<string, unknown>, host: string): string | null => {
+    const opts = (args.options ?? {}) as { sendWith?: unknown; noSendChange?: unknown };
     const ref = typeof args.reference === 'string' ? args.reference : undefined;
-    // Unknown reference: assume held. The toolbox refuses it anyway; the safe side is never to relay.
-    return ref !== undefined && signRefs.has(ref) ? (signRefs.get(ref) as boolean) : true;
+    if (call === 'signAction') {
+      const p = ref ? signRefs.get(ref) : undefined;
+      if (!p || p.origin !== host) return 'this signAction reference was not created by this site in this serve session';
+    }
+    if (call === 'createAction' || call === 'signAction') {
+      const bad = strings(opts.sendWith).filter((t) => owners.get(t) !== host);
+      if (bad.length)
+        return `sendWith names ${bad.join(', ')}, which this site did not build with noSend in this serve session (a build from before a serve restart can't be sent this way: abort it and build again)`;
+      const badChange = strings(opts.noSendChange).filter((op) => owners.get(op.split('.')[0]) !== host);
+      if (badChange.length) return `noSendChange names ${badChange.join(', ')}, which this site did not build in this serve session`;
+    }
+    if (call === 'abortAction' && ref) {
+      const who = owners.get(ref) ?? signRefs.get(ref)?.origin;
+      if (who && who !== host) return 'this action was built by another site';
+    }
+    return null;
+  };
+
+  const isNewTx = (args: Record<string, unknown>) =>
+    !!((args.outputs as unknown[] | undefined)?.length || (args.inputs as unknown[] | undefined)?.length) || !strings((args.options as { sendWith?: unknown } | undefined)?.sendWith).length;
+  /** Every build is made noSend first, so serve can price it (fee included) before anything leaves; serve then sends it. */
+  const forced = (opts: Record<string, unknown>) => ({ ...opts, noSend: true, sendWith: [], returnTXIDOnly: false });
+  type Ctx = { committed: boolean };
+  type Done = { out: ActionResult & Record<string, unknown>; full?: number[]; fee: number; noSend: boolean } | { refused: string };
+
+  /**
+   * Local mode createAction/signAction: build noSend, check the real cost (outputs + network fee) against the fee cap,
+   * the per-payment cap, the session budget and the account gate, abort if over, else send it with sendWith
+   * (unless the site asked for noSend). A sendWith-only createAction moves no new money (its txids were checked).
+   */
+  const localAction = async (call: string, args: Record<string, unknown>, host: string, sats: number, usd: number, ctx: Ctx): Promise<Done> => {
+    const opts = (args.options ?? {}) as Record<string, unknown>;
+    if (call === 'createAction' && !isNewTx(args)) {
+      const out = (await w.call(call, args, host)) as ActionResult & Record<string, unknown>;
+      return { out, fee: 0, noSend: false };
+    }
+    const bool = (v: unknown) => (typeof v === 'boolean' ? v : undefined);
+    let p: Pending;
+    let result: ActionResult & Record<string, unknown>;
+    const ref = typeof args.reference === 'string' ? args.reference : '';
+    if (call === 'createAction') {
+      p = {
+        origin: host,
+        noSend: opts.noSend === true,
+        sendWith: strings(opts.sendWith),
+        acceptDelayedBroadcast: bool(opts.acceptDelayedBroadcast),
+        returnTXIDOnly: opts.returnTXIDOnly === true,
+        sats,
+        usd,
+        description: String(args.description ?? ''),
+        inputBEEF: Array.isArray(args.inputBEEF) ? (args.inputBEEF as number[]) : undefined,
+      };
+      result = (await w.call('createAction', { ...args, options: forced(opts) }, host)) as typeof result;
+      const pendingRef = result.signableTransaction?.reference;
+      if (typeof pendingRef === 'string') {
+        rememberRef(pendingRef, p);
+        return { out: result, fee: 0, noSend: true };
+      }
+    } else {
+      const prior = signRefs.get(ref) as Pending;
+      p = {
+        ...prior,
+        noSend: bool(opts.noSend) ?? prior.noSend,
+        sendWith: Array.isArray(opts.sendWith) ? strings(opts.sendWith) : prior.sendWith,
+        acceptDelayedBroadcast: bool(opts.acceptDelayedBroadcast) ?? prior.acceptDelayedBroadcast,
+        returnTXIDOnly: bool(opts.returnTXIDOnly) ?? prior.returnTXIDOnly,
+      };
+      result = (await w.call('signAction', { ...args, options: forced(opts) }, host)) as typeof result;
+      signRefs.delete(ref);
+    }
+
+    const txid = typeof result.txid === 'string' ? result.txid : undefined;
+    const full = result.tx?.length ? Array.from(result.tx) : undefined;
+    const refuse = async (why: string): Promise<Done> => {
+      if (txid) await w.call('abortAction', { reference: txid }, host).catch(() => undefined);
+      // signAction: the whole action is dropped and the site never got it signed, so its createAction reservation goes back.
+      if (call === 'signAction') sessionSpentUsd = Math.max(0, sessionSpentUsd - p.usd);
+      return { refused: why };
+    };
+    let fee: number | undefined;
+    try {
+      if (!txid || !full) return await refuse('the wallet returned no transaction to check');
+      fee = feeOf(full, p.inputBEEF);
+      if (fee === undefined) return await refuse("could not work out this payment's network fee, so nothing was sent");
+      if (fee > maxFee) return await refuse(`the network fee, ${fee} sats, is over the ${maxFee}-sat fee cap per payment (serve --max-fee-sats)`);
+      const rate = await price();
+      const feeUsd = (fee / 1e8) * rate;
+      const totalUsd = ((p.sats + fee) / 1e8) * rate;
+      if (totalUsd > maxPerAction + 1e-9) return await refuse(`$${totalUsd.toFixed(4)} with the network fee is over the $${maxPerAction} per-payment cap for sites`);
+      // The outputs are reserved already (this call, or the createAction before a signAction); add the fee.
+      if (sessionSpentUsd + feeUsd > budget + 1e-9) return await refuse(`this serve session's $${budget} budget is used ($${sessionSpentUsd.toFixed(4)} spent)`);
+      // createAction: nothing logged yet, so the gate sees outputs + fee. signAction: its outputs were logged at createAction.
+      const g = gateAction(o.account, { kind: 'send', token: 'BSV', usd: call === 'createAction' ? totalUsd : feeUsd, to: host });
+      if (!g.ok) return await refuse(g.reason);
+      if (g.paper) return await refuse('paper mode: nothing is signed');
+      sessionSpentUsd += feeUsd;
+    } catch (e) {
+      if (txid) await w.call('abortAction', { reference: txid }, host).catch(() => undefined);
+      throw e;
+    }
+    ctx.committed = true;
+    hold(txid, host, full); // until it is sent; a failed send leaves it to this site to retry or abort
+    const sw = [...p.sendWith, ...(p.noSend ? [] : [txid])];
+    if (sw.length) {
+      const sent = (await w.call(
+        'createAction',
+        {
+          description: p.description.length >= 5 ? p.description : 'bwalletx serve: send',
+          options: { sendWith: sw, ...(p.acceptDelayedBroadcast !== undefined && { acceptDelayedBroadcast: p.acceptDelayedBroadcast }) },
+        },
+        host,
+      )) as ActionResult & { notDelayedResults?: unknown };
+      result.sendWithResults = sent.sendWithResults;
+      result.notDelayedResults = sent.notDelayedResults;
+    }
+    if (!p.noSend) delete result.noSendChange;
+    if (p.returnTXIDOnly) delete result.tx;
+    return { out: result, full, fee, noSend: p.noSend };
   };
 
   const send = (res: ServerResponse, status: number, body: unknown, origin?: string) => {
@@ -621,13 +826,18 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
     const authed = checkToken(host, bearerOf(req.headers.authorization));
     if (!authed) {
       if (req.method === 'POST' && UNAUTHENTICATED.has(call)) {
-        return send(res, 200, call === 'getVersion' ? { version: SERVE_VERSION } : { authenticated: false }, origin);
+        return send(res, 200, call === 'getVersion' ? { version: serveVersion() } : { authenticated: false }, origin);
       }
       say(`refused ${host} ${call || '(no call)'}: not paired (no valid token)`);
       return send(res, 401, refusal('bwalletx serve: this site is not paired; POST /pair and approve it in the serve terminal'), origin);
     }
-    // serve answers for itself, paired or not, so a client can tell a serve that holds noSend builds (0.6.1+) from an older one.
-    if (call === 'getVersion' && req.method === 'POST') return send(res, 200, { version: SERVE_VERSION }, origin);
+    // serve answers for itself, so a client can tell a 0.6.1+ serve from an older one. Paired mode adds the phone's
+    // PIN level (`; pin=N;`), which sites read.
+    if (call === 'getVersion' && req.method === 'POST') {
+      if (!w.paired) return send(res, 200, { version: serveVersion() }, origin);
+      const phone = (await w.call('getVersion', {}, host).catch(() => null)) as { version?: unknown } | null;
+      return send(res, 200, { version: pairedVersion(phone?.version) }, origin);
+    }
     if (req.method !== 'POST' || !ALLOWED.has(call) || NEVER_FORWARD.has(call) || (w.paired && !PAIRED_FORWARD.has(call))) return send(res, 400, refusal(`bwalletx serve: ${call || 'this call'} is not offered`), origin);
 
     const chunks: Buffer[] = [];
@@ -651,11 +861,19 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
     // createAction/signAction: gate → sign → log under the account's spend lock, so parallel requests
     // (or another process on the same account) can't all pass the daily cap before any is logged.
     const spends = call === 'createAction' || call === 'signAction';
-    return spends ? withSpendLock(o.account, () => runAndRefund(res, call, args, host, origin)) : run(res, call, args, host, origin);
+    return spends ? withSpendLock(o.account, () => runAndRefund(res, call, args, host, origin)) : run(res, call, args, host, origin, { committed: false });
   };
 
-  const run = async (res: ServerResponse, call: string, args: Record<string, unknown>, host: string, origin: string) => {
+  const run = async (res: ServerResponse, call: string, args: Record<string, unknown>, host: string, origin: string, ctx: Ctx) => {
     let sats = 0;
+    let reservedUsd = 0;
+    if (!w.paired) {
+      const why = localCheck(call, args, host);
+      if (why) {
+        say(`REFUSED ${host} ${call}: ${why}`);
+        return send(res, 400, refusal(`bWalletX agent refused: ${why}`), origin);
+      }
+    }
     if (isAuthProtocolCall(call, args) && !singleSite) {
       say(`refused ${host} ${call}: login signatures need serve to allow exactly one site`);
       return send(res, 400, refusal('bwalletx serve: login (BRC-103) signatures are only made when one site is allowed; restart with a single --origin'), origin);
@@ -688,29 +906,43 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
       }
       if (g.paper) return send(res, 400, refusal('bWalletX agent is in paper mode: nothing is signed'), origin);
       sessionSpentUsd += usd; // reserved under the spend lock; a failed sign below gives it back
+      reservedUsd = usd;
     }
 
-    // Read before the call: the toolbox fills args.options in place.
     const acts = call === 'createAction' || call === 'signAction';
-    const noSend = acts && isNoSend(call, args);
     try {
-      const out = await w.call(call, args, host);
-      // The phone broadcasts what it signs; only the CLI's own wallet needs the ARC nudge, and only for what
-      // the wallet itself sent: never a noSend build (13 Nov 2026 review).
-      if (!w.paired && acts) afterAction(call, args, out, noSend);
+      let out: unknown;
+      let fee = 0;
+      let noSend = acts && (args.options as { noSend?: unknown } | undefined)?.noSend === true;
+      if (!w.paired && acts) {
+        const d = await localAction(call, args, host, sats, reservedUsd, ctx);
+        if ('refused' in d) {
+          say(`REFUSED ${host} ${call}: ${d.refused}`);
+          return send(res, 400, refusal(`bWalletX agent refused: ${d.refused}`), origin);
+        }
+        out = d.out;
+        fee = d.fee;
+        noSend = d.noSend;
+        // The phone broadcasts what it signs; only the CLI's own wallet needs the ARC nudge (never a noSend build).
+        relay(d.out, d.noSend, d.full);
+      } else {
+        out = await w.call(call, args, host);
+      }
       if (!w.paired && call === 'abortAction' && typeof args.reference === 'string') {
-        held.delete(args.reference);
+        release(args.reference);
         signRefs.delete(args.reference);
       }
       if (LOGGED.has(call)) {
         const a = args as { description?: string };
         const r = out as { txid?: string };
-        const usd = sats ? (sats / 1e8) * (await price().catch(() => 0)) : 0;
+        const spent = sats + fee;
+        const usd = spent ? (spent / 1e8) * (await price().catch(() => 0)) : 0;
         const tag = noSend && r?.txid ? ' (noSend: built, not sent)' : '';
         appendLog(o.account, {
           at: Date.now(),
-          action: call === 'createAction' ? (sats ? 'send' : 'sign') : `brc100-${call}`,
-          detail: `${host}: ${call}${a.description ? ` "${a.description}"` : ''}${r?.txid ? ` ${r.txid}` : ''}${sats ? ` (${sats} sats)` : ''}${tag}`,
+          // A fee-only action is still a spend: it counts toward the rate limit and the daily cap.
+          action: acts && spent ? 'send' : call === 'createAction' ? 'sign' : `brc100-${call}`,
+          detail: `${host}: ${call}${a.description ? ` "${a.description}"` : ''}${r?.txid ? ` ${r.txid}` : ''}${sats ? ` (${sats} sats)` : ''}${fee ? ` (fee ${fee} sats)` : ''}${tag}`,
           usd,
         });
         say(`${host} ${call}${a.description ? `: ${a.description}` : ''}${r?.txid ? ` → ${r.txid}` : ''}${tag}`);
@@ -726,8 +958,10 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
   };
   const runAndRefund = async (res: ServerResponse, call: string, args: Record<string, unknown>, host: string, origin: string) => {
     const before = sessionSpentUsd;
-    await run(res, call, args, host, origin);
-    if (res.statusCode !== 200 && sessionSpentUsd > before) sessionSpentUsd = before;
+    const ctx: Ctx = { committed: false };
+    await run(res, call, args, host, origin, ctx);
+    // Refund only what was never signed and sent: once a build passed every check and was handed on, it stays counted.
+    if (res.statusCode !== 200 && !ctx.committed && sessionSpentUsd > before) sessionSpentUsd = before;
   };
 
   const server = createServer((req, res) => {

@@ -16,7 +16,7 @@ const dir = mkdtempSync(join(tmpdir(), 'bwx-one-wallet-'));
 process.env.BWALLETX_HOME = dir;
 
 const { writeConfig, writeJsonFile } = await import('./store');
-const { serve, pairedBackend } = await import('./brc100');
+const { serve, pairedBackend, serveVersion, pairedVersion } = await import('./brc100');
 const { issueToken, checkToken } = await import('./servePairing');
 /** Every serve call now needs a pairing token; the tests pair each origin up front. */
 const tokens = new Map<string, string>();
@@ -73,7 +73,7 @@ async function startPhone(host: string, c: string, cliPub: string, phoneKey: Pri
     const p = msg.params as Seen;
     seen.push(p);
     if (mode === 'silent') return;
-    const result = p.method === 'getPublicKey' ? { publicKey: phoneKey.toPublicKey().toString() } : p.method === 'createAction' ? { txid: 'ab'.repeat(32), tx: [1, 2, 3] } : { ok: true };
+    const result = p.method === 'getPublicKey' ? { publicKey: phoneKey.toPublicKey().toString() } : p.method === 'createAction' ? { txid: 'ab'.repeat(32), tx: [1, 2, 3] } : p.method === 'getVersion' ? { version: 'bwalletx-5.1.9; pin=2;' } : { ok: true };
     ws.send(JSON.stringify(await sealer.seal({ t: 'res', id: msg.id, result })));
   });
   return { seen, close: () => ws.close() };
@@ -131,12 +131,19 @@ describe('serve --wallet paired', () => {
     expect(arcCalls).toEqual([]);
   });
 
-  it('answers getVersion itself (the serve version), without asking the phone', async () => {
+  it("answers getVersion as serve's version plus the phone's PIN level", async () => {
     const { post, fake } = await setup('answer');
     const r = await post('getVersion', {});
     expect(r.status).toBe(200);
-    expect(String(r.body.version)).toMatch(/^bwalletx-serve-\d+\.\d+\.\d+$/);
-    expect(fake.seen).toEqual([]);
+    expect(r.body.version).toBe(`${serveVersion()}; pin=2;`);
+    expect(String(r.body.version).length).toBeLessThan(30);
+    expect(fake.seen.map((s) => s.method)).toEqual(['getVersion']);
+  });
+
+  it('getVersion without a PIN level from the phone (or no phone) is the plain serve version', () => {
+    expect(pairedVersion('wallet-brc100-1.0.0')).toBe(serveVersion());
+    expect(pairedVersion(undefined)).toBe(serveVersion());
+    expect(pairedVersion('x; pin=4;')).toBe(`${serveVersion()}; pin=4;`);
   });
 
   it('refuses disallowed origins locally', async () => {

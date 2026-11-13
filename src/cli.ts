@@ -630,9 +630,10 @@ program
   .option('-p, --port <n>', 'port', '3321')
   .option('--max-usd <n>', 'most one payment from a site may move, in USD', '1')
   .option('--budget-usd <n>', 'most this serve session may move in total, in USD', '5')
+  .option('--max-fee-sats <n>', 'most network fee one payment may pay, in sats (local/shared wallet)', '10000')
   .option('--allow-token-transfers', 'let sites move BSV-21 tokens / ordinals (the USD caps cannot value them)')
   .action(
-    run(async (o: { account?: string; origin?: string[]; listPairings?: boolean; revoke?: string; port: string; shared?: boolean; wallet?: string; maxUsd: string; budgetUsd: string; allowTokenTransfers?: boolean }) => {
+    run(async (o: { account?: string; origin?: string[]; listPairings?: boolean; revoke?: string; port: string; shared?: boolean; wallet?: string; maxUsd: string; budgetUsd: string; maxFeeSats: string; allowTokenTransfers?: boolean }) => {
       const sp = await import('./servePairing.js');
       if (o.listPairings) {
         const all = sp.listPairings();
@@ -664,8 +665,9 @@ program
           rl.close();
         }
       };
-      const limits = { maxUsdPerAction: Number(o.maxUsd), sessionBudgetUsd: Number(o.budgetUsd), allowTokenTransfers: !!o.allowTokenTransfers, confirmPairing };
+      const limits = { maxUsdPerAction: Number(o.maxUsd), sessionBudgetUsd: Number(o.budgetUsd), maxFeeSats: Number(o.maxFeeSats), allowTokenTransfers: !!o.allowTokenTransfers, confirmPairing };
       if (!(limits.maxUsdPerAction >= 0) || !(limits.sessionBudgetUsd >= 0)) throw new Error('--max-usd and --budget-usd must be numbers >= 0');
+      if (!(Number.isInteger(limits.maxFeeSats) && limits.maxFeeSats >= 0)) throw new Error('--max-fee-sats must be a whole number of sats >= 0');
       const kind = o.wallet ?? (o.shared ? 'shared' : 'local');
       if (!['local', 'shared', 'paired'].includes(kind)) throw new Error(`--wallet must be local, shared or paired (got "${kind}")`);
       if (o.shared && kind !== 'shared') throw new Error('--shared conflicts with --wallet ' + kind);

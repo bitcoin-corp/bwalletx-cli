@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
-import { P2PKH, PrivateKey } from '@bsv/sdk';
+import { P2PKH, PrivateKey, Script, Transaction } from '@bsv/sdk';
 
 const dir = mkdtempSync(join(tmpdir(), 'bwx-serve-safety-'));
 process.env.BWALLETX_HOME = dir;
@@ -36,7 +36,32 @@ async function setup(origins: string[], opts: Record<string, unknown> = {}) {
   writeConfig({ accounts: { main: { name: 'main', kind: 'paired', identityAddress: '1x', payAddress: '', ordAddress: '', dailyCapUsd: null, stopped: false, importedAt: Date.now() } }, defaultAccount: 'main' } as never);
   const calls: string[] = [];
   const owned = (opts.owned as Set<string> | undefined) ?? new Set<string>();
-  const w = { paired: false, call: async (m: string) => (calls.push(m), m === 'createAction' ? { txid: 'cd'.repeat(32) } : { signature: [1] }), owned: async () => owned, close: async () => undefined };
+  // createAction builds a real (unsigned) tx paying the outputs from a 1 BSV coin, 50 sats fee, so serve can price it.
+  const build = (args: { outputs?: { lockingScript: string; satoshis: number }[] }) => {
+    const fund = new Transaction();
+    fund.addInput({ sourceTXID: 'ab'.repeat(32), sourceOutputIndex: 0, unlockingScript: new Script(), sequence: 0xffffffff });
+    fund.addOutput({ lockingScript: Script.fromHex(lock), satoshis: 100_000_000 });
+    const t = new Transaction();
+    t.addInput({ sourceTransaction: fund, sourceOutputIndex: 0, unlockingScript: new Script(), sequence: 0xffffffff });
+    let out = 0;
+    for (const o of args.outputs ?? []) {
+      t.addOutput({ lockingScript: Script.fromHex(o.lockingScript), satoshis: o.satoshis });
+      out += o.satoshis;
+    }
+    t.addOutput({ lockingScript: Script.fromHex(lock), satoshis: 100_000_000 - out - 50 });
+    return { txid: t.id('hex'), tx: t.toAtomicBEEF(true), sendWithResults: [] };
+  };
+  const w = {
+    paired: false,
+    call: async (m: string, a: { outputs?: []; options?: { sendWith?: string[] } }) => {
+      calls.push(m);
+      if (m !== 'createAction') return { signature: [1] };
+      if (!a.outputs?.length && a.options?.sendWith?.length) return { sendWithResults: a.options.sendWith.map((txid) => ({ txid, status: 'sending' })) };
+      return build(a);
+    },
+    owned: async () => owned,
+    close: async () => undefined,
+  };
   // $50 per BSV: 1,000,000 sats = $0.50
   const server = await serve(w, { account: 'main', origins, port: 0, arc: async () => undefined, usdPerBsv: async () => 50, ...opts });
   cleanups.push(() => new Promise((r) => server.close(r)));
@@ -63,7 +88,7 @@ describe('serve payment safety', () => {
     const { post, calls } = await setup(['shop.example'], { maxUsdPerAction: 1, sessionBudgetUsd: 0.8 });
     expect((await post('createAction', pay(1_000_000))).status).toBe(200);
     expect((await post('createAction', pay(1_000_000))).status).toBe(400);
-    expect(calls).toEqual(['createAction']);
+    expect(calls).toEqual(['createAction', 'createAction']); // the build (noSend), then its sendWith
   });
 
   it("never accepts a wildcard origin: '*' is impossible (no override exists any more)", async () => {

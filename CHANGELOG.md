@@ -2,7 +2,7 @@
 
 ## 0.6.1 (unreleased)
 
-A money fix for `serve`. If an app uses noSend through `bwalletx serve`, upgrade.
+A money fix for `serve`. If an app uses noSend through `bwalletx serve`, or sites can reach your serve, upgrade.
 
 - **`serve` no longer broadcasts a transaction built with `noSend`.** In local and shared mode serve handed every
   createAction/signAction result to ARC, including a "build only, don't send" one. An app doing a two-phase send
@@ -12,11 +12,30 @@ A money fix for `serve`. If an app uses noSend through `bwalletx serve`, upgrade
   any marked failed), never a noSend build itself. A later `createAction { options: { sendWith } }` relays exactly
   those txids, parents first. signAction follows the noSend option of its createAction when it doesn't set one.
   Paired mode never relayed and is unchanged.
+- **A site can only send its own builds.** `sendWith`, `noSendChange`, `signAction` and `abortAction` are refused
+  when they name a build another site made, or one serve didn't make in this session: another app's noSend build
+  on the same wallet (the bWalletX app in shared mode, `bwalletx store buy` between build and claim) could
+  otherwise be sent by any paired site for nothing under the caps. A build from before a serve restart can't be
+  sent with `sendWith`: abort it and build again.
+- **Network fees count.** In local and shared mode every build is made noSend first and priced from the signed
+  tx (inputs minus outputs). The fee counts toward the per-payment cap, the session budget and the daily cap, and
+  a new per-payment fee cap, `serve --max-fee-sats` (default 10,000 sats, ~100 KB of data), refuses anything
+  dearer. A refused build is aborted and never leaves the machine. Then serve sends it (unless the site asked for
+  noSend). A fee-only action (a 0-sat data write) is now logged as a spend, so it counts for the rate limit.
+  Before, a site could spend 20,000+ sats in fees on one 200 KB data write with every USD cap at $0.
 - **`getVersion` from serve now answers `bwalletx-serve-<version>`** (this release: `bwalletx-serve-0.6.1`),
-  paired or not, signed in or not. Older serves answered `bwalletx-1.0.0` before pairing and the wallet's own
-  `wallet-brc100-1.0.0` after. A client that relies on noSend should refuse anything that isn't
-  `bwalletx-serve-` 0.6.1 or later.
-- The account log marks a noSend build "(noSend: built, not sent)".
+  signed in or not. In paired mode it adds the phone's PIN level, `bwalletx-serve-0.6.1; pin=N;`. Older serves
+  answered `bwalletx-1.0.0` before pairing and the wallet's own `wallet-brc100-1.0.0` after. A client that relies
+  on noSend should refuse anything that isn't `bwalletx-serve-` 0.6.1 or later.
+- The account log marks a noSend build "(noSend: built, not sent)" and shows each payment's fee.
+- The bNamesX PC miner no longer crashes at start: serve's version is read lazily, with a built-in fallback.
+
+### Known gaps (ARC nudge only)
+
+The wallet still broadcasts in these cases; only serve's extra hand-off to ARC is skipped: a build whose BEEF
+was dropped from serve's memory (over 64 MB held, oldest first); a send that failed and was retried later by the
+wallet's own monitor; the parent of a tx that spends a noSend build's change without naming it in `sendWith`
+(the relay sends the child alone, as Extended Format); and any ARC post that fails (errors are ignored).
 
 ## 0.6.0 (unreleased)
 
