@@ -226,7 +226,7 @@ Every refusal is logged with the rule that refused it.
 
 Items that leave the account are valued in dollars where bwalletx knows a value: an OpNS name at its listing tier
 (the top tier, $500, when its name can't be read), and a listing below value counts the shortfall (OpNS tier, or
-the BSV-21 market floor, leaving out our own listings). A spend whose builder fails is released only if the wallet
+for BSV-21 what buying as many tokens would cost on the order book, our own listings left out). A spend whose builder fails is released only if the wallet
 was never asked to sign or send.
 
 ### Not covered by the USD cap
@@ -235,11 +235,14 @@ was never asked to sign or send.
 - `opns mint --to <address>`: vault and gift names are locked straight to that address as they are mined; only the
   mint fees count (against `--budget`), not the names' value.
 
-Ordinal listings are covered differently: an ordinal has no known value, so `bwalletx list` of an ordinal needs the
-owner PIN at an interactive terminal, every time. Under MCP (`list_for_sale`), without a TTY, or in an agent's shell
-it is refused. The BSV-21 floor leaves out listings made by this wallet or any account in this CLI's config (their
-recorded listings and addresses), so an agent can't lower the floor with its own listings. When only ours are
-listed, the listing is refused.
+Listings with no known value are covered differently: listing an ordinal, or BSV-21 tokens that no one else lists,
+needs the owner PIN at an interactive terminal, every time. Under MCP (`list_for_sale`), without a TTY, or in an
+agent's shell it is refused.
+
+A BSV-21 listing of N tokens is valued at what buying N would cost: the order book is walked from the cheapest
+listing up (up to 2,000 rows), and any tokens beyond what the book holds are valued at the highest price walked. So a
+1-token dust listing can't drag the value of 50 tokens down. Listings made by this wallet or any account in this
+CLI's config (recorded listings, config addresses, the wallet's own listing outputs) are left out.
 
 ## Strategies
 
@@ -311,8 +314,8 @@ by the same `@1sat/actions` code the bWalletX app uses:
 
 Every spend asks for confirmation and shows the price and fees. `-y` or `BWALLETX_YES=1` skips the prompt, for
 scripts. Each one passes the gate: `buy-listing` with its full dollar cost, `unlist` as a $0 `list` action, and `list`
-as a `list` action valued at how far below its value it is priced (OpNS tier, BSV-21 floor; see "The gate"). Listing
-an ordinal also needs the owner PIN at a terminal. A paper-mode strategy refuses these commands. `--dry-run` runs the real builder
+as a `list` action valued at how far below its value it is priced (OpNS tier, BSV-21 order book; see "The gate"). Listing
+an ordinal, or tokens no one else lists, also needs the owner PIN at a terminal. A paper-mode strategy refuses these commands. `--dry-run` runs the real builder
 against a wallet that records the `createAction` it is asked for and refuses it. You see the inputs and outputs
 it would have made, and nothing is signed or broadcast. A dry run still opens the wallet, so it asks for the passphrase.
 

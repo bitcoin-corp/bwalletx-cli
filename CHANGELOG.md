@@ -15,9 +15,11 @@ A safety release. If you let an AI agent use bwalletx, upgrade.
   at the top tier ($500), never the cheapest.
 - **Listing below value counts against the cap.** `list` / MCP `list_for_sale` used to be a $0 action, so an agent
   could list a $500 name for 1 sat and have someone else buy it. Now the shortfall (an OpNS name below its tier,
-  BSV-21 tokens below the market floor) is reserved against the daily cap and approval threshold like a send.
-  The floor leaves out listings made by this wallet or any account in this CLI's config, so an agent can't walk it
-  down. Ordinals have no known value, so listing one needs the owner PIN at a terminal (refused under MCP).
+  BSV-21 tokens below what buying as many would cost on the order book) is reserved against the daily cap and
+  approval threshold like a send. The book is walked from the cheapest listing up for the number of tokens listed,
+  so one dust listing can't drag the value down. Listings made by this wallet or any account in this CLI's config
+  are left out. Ordinals, and tokens no one else lists, have no known value, so listing one needs the owner PIN at a
+  terminal (refused under MCP).
 - **An error after broadcast stays counted.** A buy, listing or name send whose builder answers with an error is
   released only if the wallet was never asked to sign or send; otherwise it is counted as `failed`.
 - **`buy_product` no longer calls a pending payment "Bought".** The bWalletX Store now marks a purchase paid only
