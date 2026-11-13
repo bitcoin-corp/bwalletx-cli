@@ -38,10 +38,10 @@ export async function banner(out: (s: string) => void = (s) => process.stdout.wr
   const width = Math.max(...ART.map((l) => l.length));
   // The animation moves the cursor back up ART.length lines; in a window narrower than the art the lines wrap, the
   // count is wrong and the frames smear over everything after (the pairing QR included). Animate only when it fits.
-  const fits = (process.stdout.columns ?? 0) > width;
-  if (!tty() || !fits) {
-    if (fits || !tty()) out(ART.join('\n') + '\n');
-    else out(yellow('bWalletX') + '\n');
+  const cols = process.stdout.columns;
+  if (!tty() || !cols || cols <= width) {
+    // No animation: the still logo (yellow on a terminal), or the name alone in a window too narrow for the art.
+    out(cols && cols <= width ? yellow('bWalletX') + '\n' : ART.map((l) => (tty() ? yellow(l) : l)).join('\n') + '\n');
     return;
   }
   out('\x1b[?25l'); // hide cursor
@@ -56,7 +56,8 @@ export async function banner(out: (s: string) => void = (s) => process.stdout.wr
 /** Colour a terminal QR (from qrcode's `small` renderer) yellow on the terminal background, framed with the brand. */
 export const brandQr = (qr: string) => {
   const lines = qr.replace(/\n+$/, '').split('\n');
-  const w = Math.max(...lines.map((l) => [...l].length));
+  // Visible width: escape codes don't take a column.
+  const w = Math.max(...lines.map((l) => [...l.replace(/\x1b\[[0-9;]*m/g, '')].length));
   const title = ' bWalletX · scan to pair ';
   const pad = Math.max(0, Math.floor((w - title.length) / 2));
   return [yellow(' '.repeat(pad) + title), ...lines.map((l) => yellow(l))].join('\n') + '\n';
