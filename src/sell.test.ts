@@ -139,7 +139,7 @@ function setup(baskets: Baskets, over: Partial<SellDeps> = {}) {
     unspent: async () => true,
     rate: async () => 50,
     overlayFee: async () => ({ address: addr(), sats: 1000 }),
-    tokenListings: async () => [],
+    tokenListings: async () => ({ listings: [], raw: 0 }),
     ourListings: () => ({ outpoints: new Set<string>(), sellers: new Set<string>() }),
     ownerApprove: calls.ownerApprove,
     gate: calls.gate,
@@ -256,7 +256,7 @@ describe('list below value: the shortfall counts against the cap (review fix)', 
   test('BSV-21 below the market floor counts the shortfall; an unreadable floor refuses', async () => {
     // 5000 raw at 2 decimals = 50 TEST; floor $0.01/token = $0.50.
     // $0.01/token at $50/BSV = 20,000 sats per token.
-    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => [mkt('e1', 20_000)] });
+    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => bk([mkt('e1', 20_000, null, 100)]) });
     await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 });
     expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ kind: 'list', token: TOKEN, usd: expect.closeTo(0.5, 4) }));
     const u = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => Promise.reject(new Error('GorillaPool down')) });
@@ -272,6 +272,7 @@ describe('list below value: the shortfall counts against the cap (review fix)', 
   });
 });
 
+const bk = (rows: ReturnType<typeof mkt>[], raw = rows.length) => ({ listings: rows, raw });
 const mkt = (tag: string, perToken: number, seller: string | null = null, tokens = 1) => ({ outpoint: `${tag.padEnd(64, '0')}_0`, priceSats: perToken * tokens, amount: String(tokens), tokens, seller, pricePerTokenSats: perToken });
 
 describe('BSV-21 floor leaves out our own listings (review fix 2)', () => {
@@ -279,8 +280,9 @@ describe('BSV-21 floor leaves out our own listings (review fix 2)', () => {
 
   test('bookCostSats walks the outside book for N tokens; skips ours; null when the outside book is empty', () => {
     const ours = { outpoints: new Set([`${'a1'.padEnd(64, '0')}_0`]), sellers: new Set(['1Me']) };
-    // 3 tokens: 700 + 900 + (beyond the book) 900.
-    expect(bookCostSats([mkt('a1', 1), mkt('b1', 5, '1Me'), mkt('c1', 900), mkt('d1', 700)], ours, 3)).toBe(2_500);
+    expect(bookCostSats([mkt('a1', 1), mkt('b1', 5, '1Me'), mkt('c1', 900), mkt('d1', 700)], ours, 2)).toBe(1_600);
+    // Fewer outside tokens than listed: no value (never extrapolated).
+    expect(bookCostSats([mkt('a1', 1), mkt('b1', 5, '1Me'), mkt('c1', 900), mkt('d1', 700)], ours, 3)).toBeNull();
     // Part of a listing: 2 of 10 at 100 each.
     expect(bookCostSats([mkt('c1', 100, null, 10)], none(), 2)).toBe(200);
     expect(bookCostSats([mkt('a1', 1), mkt('b1', 5, '1Me')], ours, 3)).toBeNull();
@@ -293,14 +295,14 @@ describe('BSV-21 floor leaves out our own listings (review fix 2)', () => {
     const mine = mkt('c3', 3, key.toPublicKey().toAddress()); // this wallet's cancel address for the token
     const t = setup(
       { [BSV21_BASKET]: [tokenOut(`${TXID}.1`), out(held.outpoint.replace('_', '.'), ['ordlock', `bsv21:${TOKEN}`])] },
-      { tokenListings: async () => [recorded, held, mine, mkt('e1', 20_000)], ourListings: () => ({ outpoints: new Set([recorded.outpoint]), sellers: new Set(['1Other']) }) },
+      { tokenListings: async () => bk([recorded, held, mine, mkt('e1', 20_000, null, 100)]), ourListings: () => ({ outpoints: new Set([recorded.outpoint]), sellers: new Set(['1Other']) }) },
     );
     await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 });
     expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ usd: expect.closeTo(0.5, 4) }));
   });
 
   test('only our own listings on the market: the owner decides (PIN), not refused and not $0 unasked', async () => {
-    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => [mkt('a1', 1, '1Other')], ourListings: () => ({ outpoints: new Set<string>(), sellers: new Set(['1Other']) }) });
+    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => bk([mkt('a1', 1, '1Other')]), ourListings: () => ({ outpoints: new Set<string>(), sellers: new Set(['1Other']) }) });
     expect((await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 })).ok).toBe(true);
     expect(t.calls.ownerApprove).toHaveBeenCalledWith(expect.stringMatching(/no one else lists this token/));
   });
@@ -310,31 +312,31 @@ describe('r2 review: the outside book is walked, not just its floor (review fix 
   test('ACCOMPLICE: a 1-token dust listing at 1 sat no longer drags 50 tokens to $0', async () => {
     // Book: accomplice 1 token at 1 sat, a real listing of 100 tokens at 20,000 sats each. 50 tokens cost
     // 1 + 49 × 20,000 = 980,001 sats ≈ $0.49 at $50/BSV; listed for 50 sats.
-    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => [mkt('ff', 1, '1Accomplice'), mkt('e1', 20_000, null, 100)] });
+    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => bk([mkt('ff', 1, '1Accomplice'), mkt('e1', 20_000, null, 100)]) });
     expect((await listForSale({ outpoint: `${TXID}_1`, priceSats: 50 })).ok).toBe(true);
     expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ usd: expect.closeTo(((980_001 - 50) / 1e8) * 50, 6) }));
     expect(t.calls.ownerApprove).not.toHaveBeenCalled();
   });
 
-  test('ACCOMPLICE with only dust on the book: the rest is valued at the highest price walked', async () => {
-    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => [mkt('ff', 1, '1Accomplice'), mkt('fe', 20_000, '1Accomplice')] });
+  test('ACCOMPLICE with only a thin book: nothing is extrapolated, the owner decides', async () => {
+    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => bk([mkt('ff', 1, '1Accomplice'), mkt('fe', 20_000, '1Accomplice')]) });
     await listForSale({ outpoint: `${TXID}_1`, priceSats: 50 });
-    // 1 + 20,000 + 48 × 20,000 = 980,001 sats.
-    expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ usd: expect.closeTo(((980_001 - 50) / 1e8) * 50, 6) }));
+    expect(t.calls.ownerApprove).toHaveBeenCalledWith(expect.stringMatching(/order book holds only 2 of the 50 tokens/));
+    expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ usd: 0 }));
   });
 
   test('HONEST: the only seller of its own token can list a second tranche with the owner PIN', async () => {
-    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => [mkt('a1', 20_000)], ourListings: () => ({ outpoints: new Set([`${'a1'.padEnd(64, '0')}_0`]), sellers: new Set<string>() }) });
+    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => bk([mkt('a1', 20_000)]), ourListings: () => ({ outpoints: new Set([`${'a1'.padEnd(64, '0')}_0`]), sellers: new Set<string>() }) });
     const r = await listForSale({ outpoint: `${TXID}_1`, priceSats: 10_000_000 });
     expect(r.ok).toBe(true);
     expect(t.calls.ownerApprove).toHaveBeenCalledOnce();
   });
 
   test('no listings at all: a 1-sat listing needs the owner; refused without one', async () => {
-    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => [] });
+    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => bk([]) });
     expect((await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 })).ok).toBe(true);
     expect(t.calls.ownerApprove).toHaveBeenCalledOnce();
-    const u = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => [], ownerApprove: async () => Promise.reject(new Error('Refused under MCP: no')) });
+    const u = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => bk([]), ownerApprove: async () => Promise.reject(new Error('Refused under MCP: no')) });
     expect(await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 })).toMatchObject({ ok: false, text: 'Refused under MCP: no' });
     expect(u.actions.sendBsv21.execute).not.toHaveBeenCalled();
   });
@@ -345,17 +347,47 @@ describe('r2 review: the outside book is walked, not just its floor (review fix 
     const seen: number[] = [];
     const t = setup(
       { [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] },
-      { tokenListings: async (_id, offset, limit) => (seen.push(offset), rows.slice(offset, offset + limit)), ourListings: () => ({ outpoints: new Set<string>(), sellers: new Set(['1Me']) }) },
+      { tokenListings: async (_id, offset, limit) => (seen.push(offset), bk(rows.slice(offset, offset + limit))), ourListings: () => ({ outpoints: new Set<string>(), sellers: new Set(['1Me']) }) },
     );
     await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 });
     expect(seen).toEqual([0, 100]); // 50 outside tokens are in the second page
     expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ usd: expect.closeTo(((1_000_000 - 1) / 1e8) * 50, 6) }));
-    const big = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`, '1000000')] }, { tokenListings: async (_id, offset, limit) => (seen.push(offset), rows.slice(offset, offset + limit)), ourListings: () => ({ outpoints: new Set<string>(), sellers: new Set(['1Me']) }) });
+    const big = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`, '1000000')] }, { tokenListings: async (_id, offset, limit) => (seen.push(offset), bk(rows.slice(offset, offset + limit))), ourListings: () => ({ outpoints: new Set<string>(), sellers: new Set(['1Me']) }) });
     seen.length = 0;
     await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 });
     expect(Math.max(...seen)).toBe(BOOK_MAX_ROWS - 100);
-    // 10,000 tokens (2 decimals): 1,850 outside rows read, the rest at the highest price walked = 10,000 × 20,000.
-    expect(big.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ usd: expect.closeTo(((200_000_000 - 1) / 1e8) * 50, 4) }));
+    // 10,000 tokens (2 decimals): the first 2,000 rows hold 1,850 outside tokens. Not extrapolated: the owner decides.
+    expect(big.calls.ownerApprove).toHaveBeenCalledWith(expect.stringMatching(/first 2000 order-book rows hold only 1850 of the 10000 tokens/));
+  });
+});
+
+describe('thin books are not extrapolated; paging uses the raw page size (review fix 4)', () => {
+  test('a single 1-sat listing does not value 1M tokens at 1M sats: the owner decides', async () => {
+    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`, '100000000')] }, { tokenListings: async () => bk([mkt('ff', 1, '1Accomplice')]) });
+    await listForSale({ outpoint: `${TXID}_1`, priceSats: 1_000_000 });
+    expect(t.calls.ownerApprove).toHaveBeenCalledWith(expect.stringMatching(/holds only 1 of the 1000000 tokens/));
+  });
+
+  test('a dust book that fills the row cap hides nothing: the owner decides', async () => {
+    const rows = [...Array.from({ length: BOOK_MAX_ROWS }, (_, i) => mkt(`d${i}`, 1, '1Accomplice')), mkt('e1', 20_000, null, 1_000_000)];
+    const t = setup({ [BSV21_BASKET]: [tokenOut(`${TXID}.1`, '1000000')] }, { tokenListings: async (_id, offset, limit) => bk(rows.slice(offset, offset + limit)) });
+    await listForSale({ outpoint: `${TXID}_1`, priceSats: 10_000 });
+    expect(t.calls.ownerApprove).toHaveBeenCalledWith(expect.stringMatching(/first 2000 order-book rows/));
+    expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ usd: 0 }));
+  });
+
+  test('a row the API returned but market.ts dropped (spent, zero price) does not end the book', async () => {
+    // Page 0: 100 raw rows, one dropped, 99 of ours; page 1: a real listing of 100 tokens at 20,000 sats.
+    const page0 = Array.from({ length: 99 }, (_, i) => mkt(`a${i}`, 1, '1Me'));
+    const seen: number[] = [];
+    const t = setup(
+      { [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] },
+      { tokenListings: async (_id, offset) => (seen.push(offset), offset === 0 ? bk(page0, 100) : bk([mkt('e1', 20_000, null, 100)])), ourListings: () => ({ outpoints: new Set<string>(), sellers: new Set(['1Me']) }) },
+    );
+    await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 });
+    expect(seen).toEqual([0, 100]);
+    expect(t.calls.ownerApprove).not.toHaveBeenCalled();
+    expect(t.calls.gate).toHaveBeenLastCalledWith('agent', expect.objectContaining({ usd: expect.closeTo(((1_000_000 - 1) / 1e8) * 50, 6) }));
   });
 });
 
@@ -380,7 +412,7 @@ describe('ordinal listings need the owner (review fix 2)', () => {
   });
 
   test('OpNS names and BSV-21 with an outside market do not ask the owner', async () => {
-    const t = setup({ [OPNS_BASKET]: [out(`${TXID}.2`, ['id:n1', 'name:alice'])], [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => [mkt('e1', 20_000)] });
+    const t = setup({ [OPNS_BASKET]: [out(`${TXID}.2`, ['id:n1', 'name:alice'])], [BSV21_BASKET]: [tokenOut(`${TXID}.1`)] }, { tokenListings: async () => bk([mkt('e1', 20_000, null, 100)]) });
     await listForSale({ outpoint: `${TXID}_2`, priceSats: 1 });
     await listForSale({ outpoint: `${TXID}_1`, priceSats: 1 });
     expect(t.calls.ownerApprove).not.toHaveBeenCalled();

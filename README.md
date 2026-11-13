@@ -235,13 +235,14 @@ was never asked to sign or send.
 - `opns mint --to <address>`: vault and gift names are locked straight to that address as they are mined; only the
   mint fees count (against `--budget`), not the names' value.
 
-Listings with no known value are covered differently: listing an ordinal, or BSV-21 tokens that no one else lists,
+Listings with no known value are covered differently: listing an ordinal, or more BSV-21 tokens than others list,
 needs the owner PIN at an interactive terminal, every time. Under MCP (`list_for_sale`), without a TTY, or in an
 agent's shell it is refused.
 
 A BSV-21 listing of N tokens is valued at what buying N would cost: the order book is walked from the cheapest
-listing up (up to 2,000 rows), and any tokens beyond what the book holds are valued at the highest price walked. So a
-1-token dust listing can't drag the value of 50 tokens down. Listings made by this wallet or any account in this
+listing up (up to 2,000 rows). If the book holds fewer than N tokens (or the walk reaches 2,000 rows first), nothing
+is extrapolated: the listing has no known value and needs the owner PIN. So a 1-token dust listing can't drag the
+value of 50 tokens down, or set the value of a million. Listings made by this wallet or any account in this
 CLI's config (recorded listings, config addresses, the wallet's own listing outputs) are left out.
 
 ## Strategies

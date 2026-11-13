@@ -67,40 +67,39 @@ export const outsideListings = (ls: Listing[], ours: OurListings) =>
 
 /**
  * What `tokens` whole tokens are worth on the outside order book: the sats it would cost to buy that many from the
- * cheapest outside listings upward (one dust listing can't drag the value down). If the book holds fewer, the rest
- * is valued at the highest price walked. null when the outside book is empty: no known value (the owner decides).
+ * cheapest outside listings upward (one dust listing can't drag the value down). null when the outside book holds
+ * fewer than `tokens` (or none): nothing is extrapolated, the listing has no known value and the owner decides.
  */
 export function bookCostSats(ls: Listing[], ours: OurListings, tokens: number): number | null {
   const book = outsideListings(ls, ours).sort((a, b) => a.pricePerTokenSats - b.pricePerTokenSats);
-  if (!book.length) return null;
   let left = tokens;
   let cost = 0;
-  let last = 0;
   for (const l of book) {
     if (left <= 0) break;
     const take = Math.min(left, l.tokens);
     cost += take === l.tokens ? l.priceSats : take * l.pricePerTokenSats;
-    last = l.pricePerTokenSats;
     left -= take;
   }
-  if (left > 0) cost += left * last;
-  return Math.ceil(cost);
+  return left > 1e-9 ? null : Math.ceil(cost);
 }
 
 /** Rows per order-book page, and the most rows read to value one listing. */
 export const BOOK_PAGE = 100;
 export const BOOK_MAX_ROWS = 2_000;
 
-/** Page through the order book (cheapest first) until the outside listings hold `tokens`, or BOOK_MAX_ROWS. */
-async function readBook(d: SellDeps, tokenId: string, ours: OurListings, tokens: number): Promise<Listing[]> {
-  const all: Listing[] = [];
+/**
+ * Page through the order book (cheapest first) until the outside listings hold `tokens`, the API runs out (a short
+ * RAW page: rows it drops as spent, zero-price or another token's don't end the book), or BOOK_MAX_ROWS (`capped`).
+ */
+async function readBook(d: SellDeps, tokenId: string, ours: OurListings, tokens: number): Promise<{ rows: Listing[]; capped: boolean }> {
+  const rows: Listing[] = [];
   for (let offset = 0; offset < BOOK_MAX_ROWS; offset += BOOK_PAGE) {
     const page = await d.tokenListings(tokenId, offset, BOOK_PAGE);
-    all.push(...page);
-    if (page.length < BOOK_PAGE) break;
-    if (outsideListings(all, ours).reduce((n, l) => n + l.tokens, 0) >= tokens) break;
+    rows.push(...page.listings);
+    if (outsideListings(rows, ours).reduce((n, l) => n + l.tokens, 0) >= tokens) return { rows, capped: false };
+    if (page.raw < BOOK_PAGE) return { rows, capped: false };
   }
-  return all;
+  return { rows, capped: true };
 }
 
 /** Cancel key per token: deterministic, so a lost record can still be cancelled (bWalletX sell.ts cancelKeyID). */
@@ -195,8 +194,8 @@ export type SellDeps = {
   unspent: (outpoint: string) => Promise<boolean>;
   rate: () => Promise<number>;
   overlayFee: (tokenId: string) => Promise<{ address: string; sats: number } | null>;
-  /** One page of a BSV-21 token's live listings, cheapest per token first (valued by walking them, ours left out). */
-  tokenListings: (tokenId: string, offset: number, limit: number) => Promise<Listing[]>;
+  /** One page of a BSV-21 token's live listings, cheapest per token first, and the raw row count the API returned. */
+  tokenListings: (tokenId: string, offset: number, limit: number) => Promise<{ listings: Listing[]; raw: number }>;
   /** Listings this CLI's accounts made (recorded outpoints) and their addresses: left out of the floor. */
   ourListings: () => OurListings;
   /** Owner approval at a terminal (ownerGate.ts requireOwner): throws when it can't be given. */
@@ -295,7 +294,10 @@ const defaultDeps = (): SellDeps => ({
   unspent: outpointUnspent,
   rate: bsvUsd,
   overlayFee,
-  tokenListings: async (id, offset, limit) => (await marketListings(id, limit, offset)).listings,
+  tokenListings: async (id, offset, limit) => {
+    const r = await marketListings(id, limit, offset);
+    return { listings: r.listings, raw: r.raw };
+  },
   ourListings: () => {
     const outpoints = new Set<string>();
     const sellers = new Set<string>();
@@ -459,17 +461,23 @@ export async function listForSale(o: ListOpts): Promise<SellResult> {
     } else if (own.kind === 'token') {
       const refuseFloor = (why: string) => ({ ok: false, text: `Refused: couldn't read the market floor to value this listing (${why}); try again` });
       let costSats: number | null;
+      let thin: string | null = null;
       try {
         const ours = d.ourListings();
         if (cancelAddress) ours.sellers.add(cancelAddress);
         // Listings this wallet holds (made here or by the app) are ours too.
         const held = await acct.ctx.wallet.listOutputs({ basket: BSV21_BASKET, includeTags: true, limit: 10_000 }, 'bwalletx-cli');
         for (const x of held.outputs) if (isListed(x)) ours.outpoints.add(normOutpoint(x.outpoint));
-        costSats = bookCostSats(await readBook(d, own.token.id, ours, tokens), ours, tokens);
+        const book = await readBook(d, own.token.id, ours, tokens);
+        costSats = bookCostSats(book.rows, ours, tokens);
+        if (costSats === null) {
+          const held2 = outsideListings(book.rows, ours).reduce((n, l) => n + l.tokens, 0);
+          thin = held2 <= 0 ? 'no one else lists this token, so it has no market value' : book.capped ? `the first ${BOOK_MAX_ROWS} order-book rows hold only ${held2} of the ${tokens} tokens, so it has no known value` : `the order book holds only ${held2} of the ${tokens} tokens, so it has no known value`;
+        }
       } catch (e) {
         return refuseFloor(e instanceof Error ? e.message : String(e));
       }
-      if (costSats === null) ownerReason = 'no one else lists this token, so it has no market value';
+      if (costSats === null) ownerReason = thin ?? 'it has no known value';
       else {
         const shortSats = Math.max(0, costSats - o.priceSats);
         if (shortSats > 0 && !(rate > 0)) return { ok: false, text: 'Refused: no BSV price to value a listing below the market; try again' };

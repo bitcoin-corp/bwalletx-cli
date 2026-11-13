@@ -39,7 +39,8 @@ export async function tokenInfo(id: string): Promise<TokenInfo> {
 }
 
 /** Live listings of a BSV-21 token, cheapest per token first. */
-export async function listings(id: string, limit = 100, offset = 0): Promise<{ info: TokenInfo; listings: Listing[] }> {
+/** `raw`: rows the API returned for this page before spent / zero-price / other-id rows are dropped (for paging). */
+export async function listings(id: string, limit = 100, offset = 0): Promise<{ info: TokenInfo; listings: Listing[]; raw: number }> {
   const rows = await getJson<GpListing[] | null>(`${GP}/bsv20/market?id=${encodeURIComponent(id)}&limit=${limit}&offset=${offset}&dir=asc&sort=price_per_token`);
   const live = (rows ?? []).filter((r) => !r.spend && r.id === id && Number(r.price) > 0);
   const info: TokenInfo = live[0] ? { id, sym: live[0].sym ?? null, dec: Number(live[0].dec ?? 0) } : await tokenInfo(id);
@@ -49,7 +50,7 @@ export async function listings(id: string, limit = 100, offset = 0): Promise<{ i
     return { outpoint: r.outpoint, priceSats, amount: r.amt, tokens, seller: r.owner ?? null, pricePerTokenSats: tokens > 0 ? priceSats / tokens : Infinity };
   });
   out.sort((a, b) => a.pricePerTokenSats - b.pricePerTokenSats);
-  return { info, listings: out };
+  return { info, listings: out, raw: (rows ?? []).length };
 }
 
 export type Price = { id: string; sym: string | null; floorSatsPerToken: number | null; floorUsdPerToken: number | null; bsvUsd: number; listings: number };
