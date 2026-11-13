@@ -7,7 +7,7 @@
 import { PrivateKey } from '@bsv/sdk';
 import { describe, expect, it } from 'vitest';
 import { claimDigest, newClaim, sessionWalletClaim, walletClaimFor } from './pair/protocol.js';
-import { newChannelUrl, pairedSiteUrl, type Pairing } from './paired.js';
+import { learnsWalletClaimV2, newChannelUrl, pairedSiteUrl, type Pairing } from './paired.js';
 
 const P = PrivateKey.fromHex('11'.repeat(32)); // phone pairing key
 const S = PrivateKey.fromHex('22'.repeat(32)); // CLI pairing key
@@ -78,5 +78,12 @@ describe('CLI site sockets', () => {
     expect(u.searchParams.get('claim')).toBe(sc);
     expect(u.searchParams.get('wc')).toBe(claimDigest(SESSION_VECTOR));
     expect(u.searchParams.get('nc')).toBeNull();
+  });
+
+  it("a v1 pairing becomes v2 when the phone's sealed ready says wcv 2 (it upgraded on resume)", () => {
+    expect(learnsWalletClaimV2(pairing(), { t: 'ready', wcv: 2 })).toBe(true);
+    expect(learnsWalletClaimV2(pairing(), { t: 'ready' })).toBe(false);
+    expect(learnsWalletClaimV2(pairing({ wv: 2 }), { t: 'ready', wcv: 2 })).toBe(false);
+    expect(learnsWalletClaimV2(pairing(), { t: 'ping' })).toBe(false);
   });
 });

@@ -29,7 +29,8 @@ export type PairLink = { v: string; r: string; c: string; k: string; o: string; 
 export type PairMessage =
   | { t: 'req'; id: string; action: string; params: unknown }
   | { t: 'res'; id: string; result?: unknown; error?: { code: string; message: string } }
-  | { t: 'ready' }
+  /** `wcv: 2`: as on the hello; also sent on a resume, so a pairing that started as v1 learns the phone upgraded. */
+  | { t: 'ready'; wcv?: 2 }
   | { t: 'ping' }
   | { t: 'close'; reason: string };
 

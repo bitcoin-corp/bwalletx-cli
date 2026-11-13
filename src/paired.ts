@@ -107,6 +107,13 @@ export function pairedSiteUrl(p: Pairing, expiry: number, save: (p: Pairing) => 
   return relaySocketUrl(p.r, p.c, 'site', expiry, p.sc, wc);
 }
 
+/**
+ * A sealed `ready` saying wcv 2 on a pairing saved as v1: the phone upgraded on a resume and its relay now holds the
+ * session claim, so from now on we re-bind it on connect (pairedSiteUrl). Exported for tests.
+ */
+export const learnsWalletClaimV2 = (p: Pick<Pairing, 'wv'>, msg: PairMessage) =>
+  msg.t === 'ready' && msg.wcv === 2 && p.wv !== 2;
+
 /** The site socket URL for a new pairing: our site claim, and the digest of the claim only the QR gives (`wc`). */
 export function newChannelUrl(relay: string, c: string, sitePub: string, expiry: number, sc: string): string {
   return relaySocketUrl(relay, c, 'site', expiry, sc, claimDigest(walletClaimFor(c, sitePub)));
@@ -308,6 +315,10 @@ export class PhoneSession {
     const msg = await this.sealer.open(f);
     if (!msg) return;
     this.persist();
+    if (learnsWalletClaimV2(this.p, msg)) {
+      this.p = { ...this.p, wv: 2 };
+      savePairing({ ...readPairing(this.name)!, ...this.sealer.counters, wv: 2 });
+    }
     if (msg.t === 'res') {
       const w = this.waiting.get(msg.id);
       if (!w) return;
