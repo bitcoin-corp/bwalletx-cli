@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import './quiet.js';
 import { banner } from './brand.js';
 import { readFileSync } from 'node:fs';
 import { Command } from 'commander';
@@ -6,7 +7,7 @@ import * as act from './actions.js';
 import * as mint from './mint.js';
 import * as sell from './sell.js';
 import * as b1 from './brc100Actions.js';
-import { login, unpair } from './paired.js';
+import { login, pingPhone, unpair } from './paired.js';
 import { agentRun } from './agent.js';
 import { confirm } from './passphrase.js';
 import { keyFilePath, allStopped, readConfig, resolveAccount, writeConfig, appendLog } from './store.js';
@@ -17,6 +18,11 @@ const VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.
 const program = new Command();
 let asJson = false;
 const print = (v: unknown, human?: () => string) => console.log(asJson || !human ? JSON.stringify(v, null, 2) : human());
+// Pairing finishes only on a yes here (see LoginOptions.confirmCode), so it needs a terminal to ask in.
+const askCode = (code: string) => confirm(`Does your phone show the code ${code}?`);
+const needTerminal = () => {
+  if (!process.stdin.isTTY) throw new Error('Run this in a terminal: you confirm the pairing code there.');
+};
 const usd = (n: number | null | undefined) => (n == null ? '—' : n >= 0.01 || n === 0 ? `$${n.toFixed(2)}` : `$${n.toPrecision(3)}`);
 const run =
   <A extends unknown[]>(fn: (...a: A) => Promise<void> | void) =>
@@ -42,11 +48,15 @@ program
   .command('login')
   .description('pair with bWalletX on your phone: keys stay on the phone (scan the QR from your agent account)')
   .option('-a, --account <name>', 'local name for this paired account', 'phone')
+  .option('--open-qr', 'also open the QR as an image (for terminals whose fonts break the text QR)')
+  .option('--full-qr', 'QR the full pairing link (bWalletX older than 5.2.56 reads only that)')
+  .option('--qr <style>', 'how to draw the QR: small (half-blocks) or solid (one module per character; for terminals that space lines apart)')
   .action(
-    run(async (o: { account: string }) => {
+    run(async (o: { account: string; openQr?: boolean; fullQr?: boolean; qr?: string }) => {
+      needTerminal();
       const owner = await og.requireOwner(`pair a phone account as "${o.account}"`);
       if (!asJson) await banner();
-      const p = await login(o.account, {});
+      const p = await login(o.account, { confirmCode: askCode, openQr: o.openQr, fullQr: o.fullQr, qrStyle: o.qr === 'small' || o.qr === 'solid' ? o.qr : undefined });
       og.approveNewAccount(owner, p.name);
       console.log(`\nPaired "${p.name}" with ${p.account}: ${p.scopes.join(', ')} until ${new Date(p.expiresAt).toLocaleDateString()}.`);
       console.log('Keep bWalletX open on that account while the CLI works. Try: bwalletx balance --account ' + p.name);
@@ -60,9 +70,10 @@ program
   .option('-a, --account <name>', 'local name for this pairing', 'main')
   .action(
     run(async (o: { account: string }) => {
+      needTerminal();
       const owner = await og.requireOwner(`pair your main wallet as "${o.account}"`);
       if (!asJson) await banner();
-      const p = await login(o.account, { mode: 'brc100' });
+      const p = await login(o.account, { mode: 'brc100', confirmCode: askCode });
       og.approveNewAccount(owner, p.name);
       console.log(`\nPaired "${p.name}" with ${p.account} as your main wallet until ${new Date(p.expiresAt).toLocaleDateString()}.`);
       console.log(`Serve it to sites: bwalletx serve --wallet paired --account ${p.name} --origin <site>. Revoke: bwalletx logout --account ${p.name}`);
@@ -74,6 +85,14 @@ program
   .description('unpair a paired account (also disconnects it on the phone)')
   .option('-a, --account <name>', 'paired account', 'phone')
   .action(run(async (o: { account: string }) => (await unpair(o.account), console.log(`Unpaired ${o.account}.`))));
+
+program
+  .command('ping')
+  .description('check a paired account: is the pairing service reachable, is the phone connected, does it answer?')
+  .option('-a, --account <name>', 'paired account', 'phone')
+  .action(run(async (o: { account: string }) => {
+    if (!(await pingPhone(o.account))) process.exitCode = 1;
+  }));
 
 const key = program.command('key').description('agent account key files');
 key

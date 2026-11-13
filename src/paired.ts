@@ -9,22 +9,30 @@
  */
 import { PrivateKey } from '@bsv/sdk';
 import QRCode from 'qrcode';
-import { brandQr, yellow } from './brand.js';
+import { terminalQr, yellow, type QrStyle } from './brand.js';
 import WebSocket from 'ws';
 import { existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 import {
+  CLAIM_FORMAT,
   DEFAULT_RELAY,
   PAIR_VERSION,
   QR_LIFETIME_S,
   Sealer,
+  claimDigest,
   deriveSession,
   isSealed,
   newChannel,
+  newClaim,
   pairUrl,
+  compactPairCode,
   relaySocketUrl,
+  sessionWalletClaim,
+  walletClaimFor,
   type HelloFrame,
   type PairMessage,
+  type RelayFrame,
 } from './pair/protocol.js';
 import { inOrder } from './pair/in-order.js';
 import { DEFAULT_DAILY_CAP_USD, home, readConfig, readJsonFile, writeConfig, writeJsonFile } from './store.js';
@@ -52,9 +60,29 @@ export type Pairing = {
   mode?: 'agent' | 'brc100';
   /** The limits the phone set for a brc100 pairing (informational: the phone enforces them). */
   caps?: Brc100Caps | null;
+  /** Our relay site claim, sent on every connect. Pairings saved before it get one on their next connect. */
+  sc?: string;
+  /** 2: the relay binds the phone's role to the pairing's session claim (wallet claim v2); we re-bind it on connect. */
+  wv?: 2;
 };
 export type Brc100Caps = { dailyUsd?: number; perCallUsd?: number; origins?: string[] };
-export type LoginOptions = { mode?: 'agent' | 'brc100' };
+export type LoginOptions = {
+  mode?: 'agent' | 'brc100';
+  /**
+   * Required. Ask whether the phone shows the same code; true only on a yes. Nothing is saved until the phone's Pair
+   * AND a yes; a no tells the phone to unpair. Whoever joins the QR's channel first gets it, so a stranger who used
+   * the QR first shows a different code (and the user's phone says the code was already used).
+   */
+  confirmCode: (code: string) => Promise<boolean>;
+  /** Relay host. Default relay.bwallet.space (tests use a local one). */
+  relay?: string;
+  /** Also open the QR as an image (macOS Preview / the desktop's viewer), for terminals whose fonts break the text QR. */
+  openQr?: boolean;
+  /** QR the full pairing link instead of the compact code (wallets older than 5.2.56 read only the full link). */
+  fullQr?: boolean;
+  /** How to draw the terminal QR (brand.ts terminalQr). Default: solid in VS Code, small elsewhere. */
+  qrStyle?: QrStyle;
+};
 export type MintInfo = { maxItems: number; maxUsd: number; itemsUsed: number; spentUsd: number; itemsLeft: number; usdLeft: number };
 
 const file = (name: string) => join(home(), 'paired', `${name}.json`);
@@ -74,36 +102,96 @@ export const parseFrame = (raw: unknown): unknown => {
 
 const open = (url: string) => new WebSocket(url, { headers: { Origin: CLI_ORIGIN }, handshakeTimeout: 10_000 });
 
+/**
+ * The site socket URL for a saved pairing. Always carries our site claim (one is created and saved for pairings from
+ * before claims), and a wallet binding: the session claim digest for a v2 pairing, the QR-bound claim's digest for a
+ * v1 one, so a channel the relay re-creates admits only the paired phone. Exported for tests.
+ */
+export function pairedSiteUrl(p: Pairing, expiry: number, save: (p: Pairing) => void = savePairing): string {
+  if (!p.sc || !CLAIM_FORMAT.test(p.sc)) {
+    p.sc = newClaim();
+    save(p);
+  }
+  // A v1 pairing sends the QR-bound claim's digest (review 13 Nov 2026): a channel the relay re-creates is then bound to
+  // it, so someone who knows only the channel ID can't take the phone's role; the phone rejoins with it and upgrades.
+  const key = PrivateKey.fromHex(p.s);
+  const wc =
+    p.wv === 2
+      ? claimDigest(sessionWalletClaim(key, p.k, p.c))
+      : claimDigest(walletClaimFor(p.c, key.toPublicKey().toString()));
+  return relaySocketUrl(p.r, p.c, 'site', expiry, p.sc, wc);
+}
+
+/**
+ * A sealed `ready` naming the phone's session claim (`wcv: 2`, `nc` = its digest) on a pairing not yet v2. True only
+ * when `nc` matches the claim we derive from our key and the phone's; we then re-bind the phone's role to it on our
+ * next connect (pairedSiteUrl), which is how a pairing that started as v1 upgrades. Exported for tests.
+ */
+export const learnsWalletClaimV2 = (p: Pick<Pairing, 'wv' | 's' | 'k' | 'c'>, msg: PairMessage) =>
+  msg.t === 'ready' &&
+  msg.wcv === 2 &&
+  p.wv !== 2 &&
+  typeof msg.nc === 'string' &&
+  msg.nc === claimDigest(sessionWalletClaim(PrivateKey.fromHex(p.s), p.k, p.c));
+
+/** The site socket URL for a new pairing: our site claim, and the digest of the claim only the QR gives (`wc`). */
+export function newChannelUrl(relay: string, c: string, sitePub: string, expiry: number, sc: string): string {
+  return relaySocketUrl(relay, c, 'site', expiry, sc, claimDigest(walletClaimFor(c, sitePub)));
+}
+
+/** The pairing QR as a PNG in the bwalletx home, opened in the system viewer. Best effort: the text QR and link stay. */
+async function showQrImage(link: string, out: (s: string) => void) {
+  try {
+    const file = join(home(), 'pair-qr.png');
+    await QRCode.toFile(file, link, { width: 560, margin: 4, errorCorrectionLevel: 'L' });
+    const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer' : 'xdg-open';
+    spawn(opener, [file], { stdio: 'ignore', detached: true }).unref();
+    out(`QR image: ${file} (opened; scan that if the one above won't read)`);
+  } catch (e) {
+    out(`Couldn't open the QR image: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 /** `bwalletx login`: show a QR, wait for the phone, save the pairing as account `name`. */
-export async function login(name: string, opts: LoginOptions = {}, out: (s: string) => void = console.log): Promise<Pairing> {
+export async function login(name: string, opts: LoginOptions, out: (s: string) => void = console.log): Promise<Pairing> {
   if (!/^[A-Za-z0-9._-]{1,40}$/.test(name) || name.startsWith('.')) throw new Error(`Bad account name "${name}"`);
+  // The code check is what stops someone who saw the QR first, so a pairing never finishes on the phone's Pair alone.
+  if (typeof opts?.confirmCode !== 'function')
+    throw new Error('login needs opts.confirmCode: ask whether the phone shows the same code');
   const deadline = Date.now() + 5 * 60_000;
   while (Date.now() < deadline) {
-    const r = await round(name, opts.mode ?? 'agent', out);
+    const r = await round(name, opts.mode ?? 'agent', out, opts.confirmCode, opts.relay ?? DEFAULT_RELAY, opts.openQr, opts.fullQr, opts.qrStyle);
     if (r) return r;
     out('\nThe code expired; here is a new one.\n');
   }
   throw new Error('Pairing timed out. Run `bwalletx login` again.');
 }
 
-function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void): Promise<Pairing | null> {
+function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void, confirmCode: LoginOptions['confirmCode'] | undefined, relay: string, openQr = false, fullQr = false, qrStyle?: QrStyle): Promise<Pairing | null> {
   const S = PrivateKey.fromRandom();
   const c = newChannel();
   const e = Math.floor(Date.now() / 1000) + QR_LIFETIME_S;
-  const link = pairUrl({ v: PAIR_VERSION, r: DEFAULT_RELAY, c, k: S.toPublicKey().toString(), o: CLI_ORIGIN, e });
+  const link = pairUrl({ v: PAIR_VERSION, r: relay, c, k: S.toPublicKey().toString(), o: CLI_ORIGIN, e });
+  const sc = newClaim();
   return new Promise((resolve, reject) => {
-    const ws = open(relaySocketUrl(DEFAULT_RELAY, c, 'site', e));
+    const ws = open(newChannelUrl(relay, c, S.toPublicKey().toString(), e, sc));
     let sealer: Sealer | null = null;
     let phoneKey = '';
+    let v2 = false;
     let infoId = '';
+    let answer: Promise<boolean> | null = null; // the user's reply to confirmCode
+    let done = false;
     const timer = setTimeout(() => !sealer && (ws.close(), resolve(null)), QR_LIFETIME_S * 1000 - 5000);
     ws.on('open', async () => {
-      out(brandQr(await QRCode.toString(link, { type: 'terminal', small: true })));
+      // The compact code implies the default relay, so a test relay gets the full link.
+      const qr = fullQr || relay !== DEFAULT_RELAY ? link : compactPairCode(c, S.toPublicKey().toString());
+      out(terminalQr(QRCode.create(qr, { errorCorrectionLevel: 'L' }).modules, qrStyle));
+      if (openQr) await showQrImage(qr, out);
       out(
         yellow(
           mode === 'brc100'
             ? 'In bWalletX: open your MAIN account, then Settings › Paired websites › Scan to connect (choose caps, sites and expiry)'
-            : 'In bWalletX: open the account to use (an AGENT account, or any account for minting only), then Settings › Paired websites › Scan to connect',
+            : 'In bWalletX: open the account to use (an AGENT account, or any account for minting only), then ☰ menu › Connect CLI & MCP › Scan',
         ),
       );
       out(`Or open this link on the phone:\n${link}\n`);
@@ -118,18 +206,40 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void)
         if (!/^0[23][0-9a-f]{64}$/i.test(String((f as HelloFrame).k))) return;
         clearTimeout(timer);
         phoneKey = (f as HelloFrame).k;
+        v2 = (f as HelloFrame).wcv === 2;
         const { key, code } = await deriveSession(S, phoneKey, c);
         sealer = new Sealer(key, 'site');
-        out(`Check your phone shows the code  ${code}  then choose what the CLI may do and tap Pair.`);
+        if (!confirmCode) {
+          out(`Check your phone shows the code  ${code}  then choose what the CLI may do and tap Pair.`);
+          return;
+        }
+        out(`The code is  ${code}`);
+        const ask = confirmCode;
+        answer = new Promise<boolean>((r) => r(ask(code))).catch(() => false);
+        void answer.then(async (ok) => {
+          if (ok || done || !sealer) return;
+          done = true;
+          await sealer.seal({ t: 'close', reason: 'codes did not match' }).then((fr) => ws.send(JSON.stringify(fr))).catch(() => {});
+          ws.close();
+          reject(new Error("The codes didn't match, so nothing was paired. Run the command again for a new code."));
+        });
+        if (!(await answer)) return;
+        out('Code confirmed. Now tap Yes, pair on your phone (choose what the CLI may do first)…');
         return;
       }
       if (!sealer || !isSealed(f)) return;
       const msg = await sealer.open(f);
       if (!msg) return;
       if (msg.t === 'ready') {
+        if (answer && !(await answer)) return; // a no unpairs the phone and rejects (above)
+        if (done) return;
+        // The phone's ready names its session claim (wallet claim v2) even when the relay didn't bind it yet.
+        if (!v2 && learnsWalletClaimV2({ s: S.toHex(), k: phoneKey, c }, msg)) v2 = true;
         infoId = `info-${Date.now()}`;
         ws.send(JSON.stringify(await sealer.seal({ t: 'req', id: infoId, action: 'info', params: mode === 'brc100' ? { mode } : {} })));
-      } else if (msg.t === 'res' && msg.id === infoId) {
+      } else if (msg.t === 'res' && infoId && msg.id === infoId) {
+        // Only the answer to our own info request, sent after ready (and after a yes, when asked).
+        if (done || (answer && !(await answer))) return;
         if (msg.error) return (ws.close(), reject(new Error(msg.error.message)));
         const i = msg.result as { account: string; identityAddress: string; scopes: string[]; expiresAt: number; mint?: MintInfo | null; caps?: Brc100Caps | null; mode?: string };
         if (mode === 'brc100' && i.mode !== 'brc100') return (ws.close(), reject(new Error('This bWalletX version does not support main-wallet pairing yet (no brc100 mode in its answer).')));
@@ -137,7 +247,7 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void)
           format: 'bwalletx.pairing/1',
           name,
           c,
-          r: DEFAULT_RELAY,
+          r: relay,
           s: S.toHex(),
           k: phoneKey,
           ...sealer.counters,
@@ -149,7 +259,10 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void)
           mint: i.mint ?? null,
           mode,
           ...(mode === 'brc100' && { caps: i.caps ?? null }),
+          sc,
+          ...(v2 && { wv: 2 as const }),
         };
+        done = true;
         savePairing(p);
         const cfg = readConfig();
         cfg.accounts[name] = {
@@ -216,7 +329,7 @@ export class PhoneSession {
     this.sealer = new Sealer(key, 'site');
     this.sealer.restore({ sent: p.sent, lastSeen: p.lastSeen });
     // A fresh expiry lets the relay recreate the channel if it was dropped; the phone rejoins on its own.
-    this.ws = open(relaySocketUrl(p.r, p.c, 'site', Math.floor(Date.now() / 1000) + QR_LIFETIME_S - 10));
+    this.ws = open(pairedSiteUrl(p, Math.floor(Date.now() / 1000) + QR_LIFETIME_S - 10));
     await new Promise<void>((resolve, reject) => {
       this.ws.once('open', () => resolve());
       this.ws.once('error', (e) => reject(new Error(`Pairing service unreachable: ${e.message}`)));
@@ -243,6 +356,10 @@ export class PhoneSession {
     const msg = await this.sealer.open(f);
     if (!msg) return;
     this.persist();
+    if (learnsWalletClaimV2(this.p, msg)) {
+      this.p = { ...this.p, wv: 2 };
+      savePairing({ ...readPairing(this.name)!, ...this.sealer.counters, wv: 2 });
+    }
     if (msg.t === 'res') {
       const w = this.waiting.get(msg.id);
       if (!w) return;
@@ -309,6 +426,61 @@ export async function callBrc100<T = unknown>(
   return callPhone<T>(name, 'brc100', params, o.timeoutMs ?? CALL_TIMEOUT_MS);
 }
 
+/**
+ * `bwalletx ping`: is the pairing service reachable, is the phone on the channel, does it answer? Sends one sealed
+ * ping (counters saved like any request) and reports each step, so "No answer from your phone" can be traced.
+ */
+export async function pingPhone(name: string, out: (s: string) => void = console.log, timeoutMs = 15_000): Promise<boolean> {
+  const p = readPairing(name);
+  if (!p) throw new Error(`"${name}" isn't a paired account`);
+  out(`Pairing "${name}": phone account "${p.account}", relay ${p.r}, channel ${p.c.slice(0, 6)}…, expires ${new Date(p.expiresAt).toISOString().slice(0, 10)}`);
+  if (Date.now() > p.expiresAt) return (out('The pairing expired. Pair again.'), false);
+  const { key } = await deriveSession(PrivateKey.fromHex(p.s), p.k, p.c);
+  const sealer = new Sealer(key, 'site');
+  sealer.restore({ sent: p.sent, lastSeen: p.lastSeen });
+  const ws = open(pairedSiteUrl(p, Math.floor(Date.now() / 1000) + QR_LIFETIME_S - 10));
+  return new Promise<boolean>((resolve) => {
+    let answered = false;
+    const finish = (ok: boolean) => {
+      clearTimeout(timer);
+      ws.close();
+      resolve(ok);
+    };
+    const timer = setTimeout(() => {
+      out(`No answer from the phone in ${timeoutMs / 1000}s. bWalletX on "${p.account}" isn't connected to this pairing.`);
+      finish(false);
+    }, timeoutMs);
+    ws.on('unexpected-response', (_req, res) => {
+      out(`Pairing service refused the connection: HTTP ${res.statusCode} ${res.statusMessage ?? ''}`.trim());
+      finish(false);
+    });
+    ws.on('error', (e) => (out(`Pairing service unreachable: ${e.message}`), finish(false)));
+    ws.on('close', (code, reason) => !answered && out(`Pairing service closed the connection (${code}${reason.length ? ` ${reason}` : ''}).`));
+    ws.on('open', async () => {
+      out('Pairing service: connected. Asking the phone…');
+      ws.send(JSON.stringify(await sealer.seal({ t: 'ping' })));
+      savePairing({ ...readPairing(name)!, ...sealer.counters });
+    });
+    ws.on('message', inOrder(async (raw: unknown) => {
+      const f = parseFrame(String(raw));
+      if (!f) return;
+      const rf = f as RelayFrame;
+      if (rf.t === 'relay') {
+        if (rf.peer) out(`Pairing service: the phone ${rf.peer === 'joined' ? 'joined' : 'left'} the channel.`);
+        if (rf.error) out(`Pairing service: ${rf.error}`);
+        return;
+      }
+      if (!isSealed(f)) return;
+      const msg = await sealer.open(f);
+      if (!msg) return out('A frame arrived that this pairing could not open (wrong key or replayed).');
+      savePairing({ ...readPairing(name)!, ...sealer.counters });
+      answered = true;
+      out(`The phone answered (${msg.t}). Paired and online.`);
+      finish(true);
+    }));
+  });
+}
+
 /** Forget a pairing here (and tell the phone, best effort). */
 export async function unpair(name: string) {
   const p = readPairing(name);
@@ -317,7 +489,7 @@ export async function unpair(name: string) {
     const { key } = await deriveSession(PrivateKey.fromHex(p.s), p.k, p.c);
     const sealer = new Sealer(key, 'site');
     sealer.restore({ sent: p.sent, lastSeen: p.lastSeen });
-    const ws = open(relaySocketUrl(p.r, p.c, 'site', Math.floor(Date.now() / 1000) + 100));
+    const ws = open(pairedSiteUrl(p, Math.floor(Date.now() / 1000) + 100));
     await new Promise<void>((res) => {
       ws.on('open', async () => (ws.send(JSON.stringify(await sealer.seal({ t: 'close', reason: 'cli logout' }))), setTimeout(res, 500)));
       ws.on('error', () => res());
