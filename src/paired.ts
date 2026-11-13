@@ -137,7 +137,7 @@ export function newChannelUrl(relay: string, c: string, sitePub: string, expiry:
 async function showQrImage(link: string, out: (s: string) => void) {
   try {
     const file = join(home(), 'pair-qr.png');
-    await QRCode.toFile(file, link, { width: 560, margin: 4 });
+    await QRCode.toFile(file, link, { width: 560, margin: 4, errorCorrectionLevel: 'L' });
     const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer' : 'xdg-open';
     spawn(opener, [file], { stdio: 'ignore', detached: true }).unref();
     out(`QR image: ${file} (opened; scan that if the one above won't read)`);
@@ -177,7 +177,7 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void,
     let done = false;
     const timer = setTimeout(() => !sealer && (ws.close(), resolve(null)), QR_LIFETIME_S * 1000 - 5000);
     ws.on('open', async () => {
-      out(brandQr(await QRCode.toString(link, { type: 'terminal', small: true })));
+      out(brandQr(await QRCode.toString(link, { type: 'terminal', small: true, errorCorrectionLevel: 'L' })));
       if (openQr) await showQrImage(link, out);
       out(
         yellow(
