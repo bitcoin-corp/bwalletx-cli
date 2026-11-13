@@ -53,6 +53,49 @@ export async function banner(out: (s: string) => void = (s) => process.stdout.wr
   out(ART.map((l) => yellow(l)).join('\n') + '\n\x1b[?25h');
 }
 
+/**
+ * The pairing QR for a terminal, drawn from the modules themselves (owner, 13 Nov 2026: it must scan in the CLI).
+ * Background colours fill a terminal cell's whole height, including the extra line spacing VS Code and others add;
+ * half-block glyphs (▀▄) don't, which leaves dark stripes between rows that phones can't read. So when the window is
+ * tall and wide enough, each module is two background-coloured spaces on its own row. Otherwise it falls back to
+ * half-blocks (half the height) with a hint. Pure black on pure white, whatever the theme.
+ */
+export const terminalQr = (modules: { size: number; get(r: number, c: number): number | boolean }, quiet = 2) => {
+  const n = modules.size + quiet * 2;
+  const dark = (r: number, c: number) =>
+    r >= quiet && c >= quiet && r < n - quiet && c < n - quiet && !!modules.get(r - quiet, c - quiet);
+  const BLK = '\x1b[48;2;0;0;0m';
+  const WHT = '\x1b[48;2;255;255;255m';
+  const RST = '\x1b[0m';
+  const rows = process.stdout.rows ?? 0;
+  const cols = process.stdout.columns ?? 0;
+  const title = ' bWalletX · scan to pair ';
+  if (rows >= n + 4 && cols >= n * 2) {
+    const lines: string[] = [];
+    for (let r = 0; r < n; r++) {
+      let l = '';
+      for (let c = 0; c < n; c++) l += (dark(r, c) ? BLK : WHT) + '  ';
+      lines.push(l + RST);
+    }
+    return [yellow(' '.repeat(Math.max(0, n - Math.floor(title.length / 2))) + title), ...lines].join('\n') + '\n';
+  }
+  // Half height: the top module is the glyph colour, the bottom one the cell background.
+  const FG = (d: boolean) => (d ? '\x1b[38;2;0;0;0m' : '\x1b[38;2;255;255;255m');
+  const lines: string[] = [];
+  for (let r = 0; r < n; r += 2) {
+    let l = '';
+    for (let c = 0; c < n; c++) l += FG(dark(r, c)) + (r + 1 < n && dark(r + 1, c) ? BLK : WHT) + '▀';
+    lines.push(l + RST);
+  }
+  const need = n + 4;
+  return (
+    [yellow(' '.repeat(Math.max(0, Math.floor((n - title.length) / 2))) + title), ...lines].join('\n') +
+    '\n' +
+    yellow(`If your phone can't read this, make this window at least ${need} rows tall and ${n * 2} wide and run again (or add --open-qr).`) +
+    '\n'
+  );
+};
+
 /** Colour a terminal QR (from qrcode's `small` renderer) yellow on the terminal background, framed with the brand. */
 export const brandQr = (qr: string) => {
   const lines = qr.replace(/\n+$/, '').split('\n');

@@ -9,7 +9,7 @@
  */
 import { PrivateKey } from '@bsv/sdk';
 import QRCode from 'qrcode';
-import { brandQr, yellow } from './brand.js';
+import { terminalQr, yellow } from './brand.js';
 import WebSocket from 'ws';
 import { existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -177,7 +177,7 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void,
     let done = false;
     const timer = setTimeout(() => !sealer && (ws.close(), resolve(null)), QR_LIFETIME_S * 1000 - 5000);
     ws.on('open', async () => {
-      out(brandQr(await QRCode.toString(link, { type: 'terminal', small: true, errorCorrectionLevel: 'L' })));
+      out(terminalQr(QRCode.create(link, { errorCorrectionLevel: 'L' }).modules));
       if (openQr) await showQrImage(link, out);
       out(
         yellow(
