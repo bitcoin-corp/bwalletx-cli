@@ -298,7 +298,7 @@ const printSell = (r: sell.SellResult) => {
 program
   .command('list <outpoint>')
   .description('list an ordinal, OpNS name or BSV-21 token output from the account wallet on the 1Sat order book (OrdLock v2)')
-  .requiredOption('--price <sats>', 'asking price in sats (whole listing)')
+  .requiredOption('--price <sats>', 'asking price in sats (whole listing); below an OpNS tier or the BSV-21 order book, the shortfall counts against the cap; ordinals and tokens beyond the book need the owner PIN')
   .option('--amount <n>', 'BSV-21 only: list this many tokens from the output (default: all of it)')
   .option('-a, --account <name>', 'agent account (its BRC-100 wallet signs)')
   .option('-y, --yes', 'do not ask for confirmation')
@@ -630,7 +630,7 @@ program
   .option('-p, --port <n>', 'port', '3321')
   .option('--max-usd <n>', 'most one payment from a site may move, in USD', '1')
   .option('--budget-usd <n>', 'most this serve session may move in total, in USD', '5')
-  .option('--allow-token-transfers', 'let sites move BSV-21 tokens / ordinals (the USD caps cannot value them)')
+  .option('--allow-token-transfers', 'let sites move BSV-21 tokens / ordinals (not covered by the USD cap: only their sats count)')
   .action(
     run(async (o: { account?: string; origin?: string[]; listPairings?: boolean; revoke?: string; port: string; shared?: boolean; wallet?: string; maxUsd: string; budgetUsd: string; allowTokenTransfers?: boolean }) => {
       const sp = await import('./servePairing.js');
@@ -706,7 +706,7 @@ opns
   .command('mint <files...>')
   .description('mine every name in the lists (sorted, deduped, resumable); vault/gift names go to --to, the rest are listed for sale')
   .option('-a, --account <name>', 'agent account (its BRC-100 wallet pays)')
-  .option('--to <address>', "owner's ordinals address: vault and gift names are locked straight to it")
+  .option('--to <address>', "owner's ordinals address: vault and gift names are locked straight to it (not covered by the USD cap)")
   .option('--to-pay <address>', 'owner address that sale proceeds pay to (OrdLock v2 pay address); default the agent account')
   .option('--vault <file>', 'names to keep: minted to --to, never listed')
   .option('--gift <file>', 'names to give: minted to --to, never listed')

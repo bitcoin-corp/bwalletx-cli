@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { P2PKH, PrivateKey, ProtoWallet, Utils, type WalletInterface } from '@bsv/sdk';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { reserveSpend } from './gate';
+import { readLog, readReservations, writeConfig } from './store';
 import { buy, checkQuote, PENDING_REPEATS_MS, setStoreDeps, signRequest, signedMessage, SIGN_KEY_ID, SIGN_PROTOCOL, type Quote, type StoreDeps } from './storeBuy';
 
 const NOW = 1_800_000_000_000;
@@ -29,8 +34,10 @@ type RigOpts = {
   claimStatus?: number | number[];
   /** The wallet's own broadcast verdict for the payment (default unproven), or a thrown review error. */
   send?: string | { throws: { reviewActionResults?: unknown; sendWithResults?: unknown } };
-  gate?: ReturnType<StoreDeps['gate']>;
+  gate?: { ok: true; paper: boolean } | { ok: false; reason: string };
   stopped?: boolean;
+  /** Use the real gate + reservation against a temporary ~/.bwalletx (account agent1). */
+  realReserve?: boolean;
 };
 
 const BODIES: Record<number, Record<string, unknown>> = {
@@ -59,6 +66,7 @@ const rig = (opts: RigOpts = {}) => {
     abortAction,
   } as unknown as WalletInterface;
   const logs: unknown[] = [];
+  const released: number[] = [];
   const sleeps: number[] = [];
   setStoreDeps({
     api: () => 'https://store.test',
@@ -75,13 +83,18 @@ const rig = (opts: RigOpts = {}) => {
     }) as unknown as typeof fetch,
     open: async () => ({ name: 'agent1', wallet, close: async () => {} }),
     rate: async () => RATE,
-    gate: () => opts.gate ?? { ok: true, paper: false },
+    // The reservation answers as the gate does; a settle is the log entry, a release logs nothing.
+    reserve: async (n, a) => {
+      if (opts.realReserve) return reserveSpend(n, a);
+      const g = opts.gate ?? { ok: true, paper: false };
+      if (!g.ok) return g;
+      return { ...g, settle: (e) => void logs.push(e), release: () => void released.push(1) };
+    },
     stopped: () => !!opts.stopped,
-    log: (_n, e) => logs.push(e),
     now: () => NOW,
     sleep: async (ms) => void sleeps.push(ms),
   });
-  return { calls, createAction, abortAction, logs, sleeps, identityKey: priv.toPublicKey().toString() };
+  return { calls, createAction, abortAction, logs, released, sleeps, identityKey: priv.toPublicKey().toString() };
 };
 
 describe('checkQuote', () => {
@@ -221,5 +234,36 @@ describe('buy', () => {
     expect(out.text).toMatch(/was sent, but the Store refused the claim \(payment_pending\)/);
     expect(out.txid).toBe('bb'.repeat(32));
     expect(r.abortAction).not.toHaveBeenCalled();
+  });
+});
+
+describe('buy: the cap is reserved before paying', () => {
+  const home = (dailyCapUsd: number) => {
+    process.env.BWALLETX_HOME = mkdtempSync(join(tmpdir(), 'bwx-store-'));
+    writeConfig({ accounts: { agent1: { name: 'agent1', identityAddress: '1Id', payAddress: '1Pay', ordAddress: '1Ord', dailyCapUsd, stopped: false, importedAt: 1 } }, defaultAccount: 'agent1' });
+  };
+
+  test('two buys at once: only the one that fits under the cap pays', async () => {
+    home(1.5);
+    const r = rig({ realReserve: true });
+    const out = await Promise.all([buy({ product: 'theme', fields: { pack: 'a' }, maxUsd: 2 }), buy({ product: 'theme', fields: { pack: 'b' }, maxUsd: 2 })]);
+    expect(out.filter((o) => o.ok)).toHaveLength(1);
+    expect(out.find((o) => !o.ok)?.text).toMatch(/Over today's cap/);
+    // One payment built and one sent (sendWith) for the one buy that passed.
+    expect(r.createAction).toHaveBeenCalledTimes(2);
+    expect(readReservations('agent1')).toEqual([]);
+    expect(readLog('agent1').filter((e) => e.usd > 0)).toEqual([expect.objectContaining({ action: 'buy', usd: 1 })]);
+  });
+
+  test('a refused intent releases the reservation; a payment sent but not granted stays counted', async () => {
+    home(10);
+    rig({ realReserve: true, intentStatus: 402 });
+    await expect(buy({ product: 'theme', fields: { pack: 'a' }, maxUsd: 2 })).rejects.toThrow();
+    expect(readReservations('agent1')).toEqual([]);
+    expect(readLog('agent1').filter((e) => e.usd > 0)).toEqual([]);
+    rig({ realReserve: true, claimStatus: 402 });
+    expect((await buy({ product: 'theme', fields: { pack: 'a' }, maxUsd: 2 })).ok).toBe(false);
+    expect(readReservations('agent1')).toEqual([]);
+    expect(readLog('agent1').filter((e) => e.usd > 0)).toEqual([expect.objectContaining({ action: 'failed', usd: 1 })]);
   });
 });

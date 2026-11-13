@@ -41,13 +41,14 @@ import {
   listAllPaged,
   loadRelistProgress,
   nameOfOutput,
+  nameValueUsd,
   planRelist,
   remaining,
   saveRelistProgress,
   summariseRelist,
   unlistedIdFor,
 } from './opnsOutputs.js';
-import { gateAction } from '../gate.js';
+import { gateAction, reserveSpend, watchBroadcast } from '../gate.js';
 import { fastRelist, MAX_FAST_BATCH } from './fastRelist.js';
 import { tierUsd, usdToSats } from './batch.js';
 
@@ -374,6 +375,37 @@ export function opnsStatus(account?: string) {
 }
 
 /**
+ * A name leaving the account is a value move: gated and reserved like any send (kill switch, account stop, daily cap,
+ * approve-above, rate limit, strategy rules) before anything is cancelled or signed, valued at its listing tier.
+ * Call `sending()` right before signing the transfer, `failed(mayHaveBroadcast)` if the builder answered with an
+ * error, `sent()` once it is broadcast, and always `end()` last: it releases the reservation only when nothing can
+ * have gone out, and counts it when a send may have (an error after broadcast, or a throw while sending).
+ * `usd` defaults to the name's tier; callers holding the output pass `nameValueUsd(output)` (top tier when unnamed).
+ */
+export async function nameMove(account: string, nm: string, to: string, usd = tierUsd(nm)) {
+  const r = await reserveSpend(account, { kind: 'send', token: 'opns', usd, to });
+  if (!r.ok) return { refused: `Refused: ${r.reason}` };
+  if (r.paper) return { refused: 'Paper mode: nothing is signed (load the strategy --live, or unload it)' };
+  let state: 'idle' | 'sending' | 'done' = 'idle';
+  return {
+    sending: () => void (state = 'sending'),
+    /** The builder answered with an error. Released only if `mayHaveBroadcast` is false (see watchBroadcast). */
+    failed: (mayHaveBroadcast: boolean) => {
+      if (!mayHaveBroadcast && state === 'sending') state = 'idle';
+    },
+    sent: (action: string, detail: string, txid: string) => {
+      state = 'done';
+      r.settle({ at: Date.now(), action, detail, usd, txid });
+    },
+    end: () => {
+      if (state === 'sending') r.settle({ at: Date.now(), action: 'failed', detail: `${nm} → ${to}: send interrupted (may have been broadcast: counted against the cap)`, usd });
+      else if (state === 'idle') r.release();
+      state = 'done';
+    },
+  };
+}
+
+/**
  * Give the owner everything back: unsold listings are cancelled, every name left in the agent wallet is sent to
  * `to`, then (unless namesOnly) the remaining sats are withdrawn to `payTo ?? to`.
  */
@@ -399,6 +431,11 @@ export async function opnsUnlist(o: { account?: string; names: string[]; to: str
         out.push({ name: nm, action: 'would unlist and send' });
         continue;
       }
+      const mv = await nameMove(name, nm, o.to);
+      if ('refused' in mv) {
+        out.push({ name: nm, action: 'refused', error: mv.refused });
+        break;
+      }
       try {
         const c = await retryOnBeefDepth(() => cancelOpnsListing.execute(ctx, { id }), syncer(w));
         if (c.error) throw new Error(String(c.error));
@@ -413,12 +450,19 @@ export async function opnsUnlist(o: { account?: string; names: string[]; to: str
           continue;
         }
         id = backId;
-        const s = await retryOnBeefDepth(() => sendOpns.execute(ctx, { id, address: o.to }), syncer(w));
-        if (s.error || !s.txid) throw new Error(String(s.error ?? 'send failed'));
+        mv.sending();
+        const watch = watchBroadcast(ctx.wallet);
+        const s = await retryOnBeefDepth(() => sendOpns.execute({ ...ctx, wallet: watch.wallet }, { id, address: o.to }), syncer(w));
+        if (s.error || !s.txid) {
+          mv.failed(!!s.txid || watch.mayHaveBroadcast());
+          throw new Error(String(s.error ?? 'send failed'));
+        }
         out.push({ name: nm, action: 'sent', txid: s.txid });
-        appendLog(name, { at: Date.now(), action: 'opns-unlist', detail: `${nm} → ${o.to} ${s.txid}`, usd: 0 });
+        mv.sent('opns-unlist', `${nm} → ${o.to} ${s.txid}`, s.txid);
       } catch (e) {
         out.push({ name: nm, action: 'failed', error: failMsg(e) });
+      } finally {
+        mv.end();
       }
     }
     for (const nm of want) if (!seen.has(nm)) out.push({ name: nm, action: 'not listed here' });
@@ -603,11 +647,17 @@ export async function opnsSweep(o: { account?: string; to: string; payTo?: strin
   const out: { name: string; action: string; txid?: string; error?: string }[] = [];
   try {
     for (const o2 of await allOpns(ctx)) {
+      // An output whose name can't be read is valued at the top tier, never the cheapest (fail closed).
       const nm = nameOfOutput(o2) || o2.outpoint;
       let id = idOfOutput(o2);
+      if (o.keepListed && o2.tags?.some((t) => t.startsWith('ordlock'))) continue;
+      const mv = await nameMove(name, nm, o.to, nameValueUsd(o2));
+      if ('refused' in mv) {
+        out.push({ name: nm, action: 'refused', error: mv.refused });
+        break;
+      }
       try {
         if (o2.tags?.some((t) => t.startsWith('ordlock'))) {
-          if (o.keepListed) continue;
           const c = await retryOnBeefDepth(() => cancelOpnsListing.execute(ctx, { id }), syncer(w));
           if (c.error) throw new Error(String(c.error));
           out.push({ name: nm, action: 'unlisted', txid: c.txid });
@@ -620,12 +670,19 @@ export async function opnsSweep(o: { account?: string; to: string; payTo?: strin
           }
           id = backId;
         }
-        const s = await retryOnBeefDepth(() => sendOpns.execute(ctx, { id, address: o.to }), syncer(w));
-        if (s.error || !s.txid) throw new Error(String(s.error ?? 'send failed'));
+        mv.sending();
+        const watch = watchBroadcast(ctx.wallet);
+        const s = await retryOnBeefDepth(() => sendOpns.execute({ ...ctx, wallet: watch.wallet }, { id, address: o.to }), syncer(w));
+        if (s.error || !s.txid) {
+          mv.failed(!!s.txid || watch.mayHaveBroadcast());
+          throw new Error(String(s.error ?? 'send failed'));
+        }
         out.push({ name: nm, action: 'sent', txid: s.txid });
-        appendLog(name, { at: Date.now(), action: 'opns-sweep', detail: `${nm} → ${o.to} ${s.txid}`, usd: 0 });
+        mv.sent('opns-sweep', `${nm} → ${o.to} ${s.txid}`, s.txid);
       } catch (e) {
         out.push({ name: nm, action: 'failed', error: failMsg(e) });
+      } finally {
+        mv.end();
       }
     }
     await w.sendWaiting();
@@ -697,6 +754,11 @@ export async function opnsSend(o: { account?: string; names: string[]; to: strin
   try {
     for (const raw of o.names) {
       const nm = raw.trim().toLowerCase();
+      const mv = o.dryRun ? null : await nameMove(name, nm, o.to);
+      if (mv && 'refused' in mv) {
+        out.push({ name: nm, action: 'refused', error: mv.refused });
+        break;
+      }
       try {
         const id = await opnsIdFor(ctx, nm);
         if (id) {
@@ -704,10 +766,15 @@ export async function opnsSend(o: { account?: string; names: string[]; to: strin
             out.push({ name: nm, action: 'would send (wallet basket)' });
             continue;
           }
-          const s = await retryOnBeefDepth(() => sendOpns.execute(ctx, { id, address: o.to }), syncer(w));
-          if (s.error || !s.txid) throw new Error(String(s.error ?? 'send failed'));
+          mv?.sending();
+          const watch = watchBroadcast(ctx.wallet);
+          const s = await retryOnBeefDepth(() => sendOpns.execute({ ...ctx, wallet: watch.wallet }, { id, address: o.to }), syncer(w));
+          if (s.error || !s.txid) {
+            mv?.failed(!!s.txid || watch.mayHaveBroadcast());
+            throw new Error(String(s.error ?? 'send failed'));
+          }
           out.push({ name: nm, action: 'sent', txid: s.txid });
-          appendLog(name, { at: Date.now(), action: 'opns-send', detail: `${nm} → ${o.to} ${s.txid}`, usd: 0 });
+          mv?.sent('opns-send', `${nm} → ${o.to} ${s.txid}`, s.txid);
           continue;
         }
         const g = await giftOutpoint(name, nm, ordAddress);
@@ -725,11 +792,14 @@ export async function opnsSend(o: { account?: string; names: string[]; to: strin
         tx.addOutput({ lockingScript: new P2PKH().lock(payAddress), change: true });
         await tx.fee(new SatoshisPerKilobyte(100));
         await tx.sign();
+        mv?.sending();
         const txid = await broadcast(tx);
         out.push({ name: nm, action: 'sent', txid });
-        appendLog(name, { at: Date.now(), action: 'opns-send', detail: `${nm} → ${o.to} ${txid}`, usd: 0 });
+        mv?.sent('opns-send', `${nm} → ${o.to} ${txid}`, txid);
       } catch (e) {
         out.push({ name: nm, action: 'failed', error: failMsg(e) });
+      } finally {
+        mv?.end();
       }
     }
     await w.sendWaiting();

@@ -149,7 +149,8 @@ find it the same way they find BSV Desktop. Built on `@bsv/wallet-toolbox`; keys
   `--budget-usd` (default $5).
 - **Tokens**: the caps value satoshis only, and a BSV-21 token output is 1 sat however much the token is
   worth. So a `createAction` with a BSV-20/21 inscribed output, or one that names the wallet's own outputs
-  as inputs, is refused unless serve runs with `--allow-token-transfers`.
+  as inputs, is refused unless serve runs with `--allow-token-transfers`. With that flag the caps still count the
+  sats, but not what the tokens or ordinals are worth (see "Not covered by the USD cap" below).
 - Paired accounts can't serve: their keys stay on the phone.
 
 ## Default limits
@@ -204,7 +205,8 @@ safe as `BWALLETX_PASSPHRASE`, which sits in your MCP client's config: an agent 
 the key itself and skip bwalletx entirely. So for real money:
 
 - use a **paired** account (keys on the phone) and set **approve-above**: bigger spends are approved on the phone,
-  and no bwalletx code path, the owner PIN included, can approve a spend;
+  and no bwalletx code path, the owner PIN included, can approve a spend over it (the PIN signs settings and
+  ordinal listings, nothing else);
 - keep key-file accounts small (the balance is the budget);
 - don't give an AI agent a shell on the machine that holds a key-file account with real money.
 
@@ -221,6 +223,27 @@ Every spending action, from the CLI, `agent run` or MCP, passes the same checks 
 7. **Paper mode** fills on the paper book and never signs
 
 Every refusal is logged with the rule that refused it.
+
+Items that leave the account are valued in dollars where bwalletx knows a value: an OpNS name at its listing tier
+(the top tier, $500, when its name can't be read), and a listing below value counts the shortfall (OpNS tier, or
+for BSV-21 what buying as many tokens would cost on the order book, our own listings left out). A spend whose builder fails is released only if the wallet
+was never asked to sign or send.
+
+### Not covered by the USD cap
+
+- `serve --allow-token-transfers`: sites may move BSV-21 tokens and ordinals; only their sats count.
+- `opns mint --to <address>`: vault and gift names are locked straight to that address as they are mined; only the
+  mint fees count (against `--budget`), not the names' value.
+
+Listings with no known value are covered differently: listing an ordinal, or more BSV-21 tokens than others list,
+needs the owner PIN at an interactive terminal, every time. Under MCP (`list_for_sale`), without a TTY, or in an
+agent's shell it is refused.
+
+A BSV-21 listing of N tokens is valued at what buying N would cost: the order book is walked from the cheapest
+listing up (up to 2,000 rows). If the book holds fewer than N tokens (or the walk reaches 2,000 rows first), nothing
+is extrapolated: the listing has no known value and needs the owner PIN. So a 1-token dust listing can't drag the
+value of 50 tokens down, or set the value of a million. Listings made by this wallet or any account in this
+CLI's config (recorded listings, config addresses, the wallet's own listing outputs) are left out.
 
 ## Strategies
 
@@ -291,8 +314,9 @@ by the same `@1sat/actions` code the bWalletX app uses:
   refuses it if the total is higher. This is a separate command from `buy <tokenId> --max-usd`, which is unchanged.
 
 Every spend asks for confirmation and shows the price and fees. `-y` or `BWALLETX_YES=1` skips the prompt, for
-scripts. Each one passes the gate: `buy-listing` with its full dollar cost, and `list` / `unlist` as a $0 `list` action
-(kill switch, rate limit, strategy rules). A paper-mode strategy refuses these commands. `--dry-run` runs the real builder
+scripts. Each one passes the gate: `buy-listing` with its full dollar cost, `unlist` as a $0 `list` action, and `list`
+as a `list` action valued at how far below its value it is priced (OpNS tier, BSV-21 order book; see "The gate"). Listing
+an ordinal, or tokens no one else lists, also needs the owner PIN at a terminal. A paper-mode strategy refuses these commands. `--dry-run` runs the real builder
 against a wallet that records the `createAction` it is asked for and refuses it. You see the inputs and outputs
 it would have made, and nothing is signed or broadcast. A dry run still opens the wallet, so it asks for the passphrase.
 

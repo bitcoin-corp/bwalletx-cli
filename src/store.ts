@@ -5,9 +5,10 @@
  *   strategies/<name>.json         loaded strategy per account
  *   paper/<name>.json              paper book per account
  *   log/<name>.jsonl               activity log, one JSON entry per line (oldest first)
+ *   reserved/<name>/<id>.json      spends gated but not settled yet (gate.ts reserveSpend); counted like log entries
  *   STOP                           kill switch: while it exists every spending action is refused
  */
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { home } from './limits.js';
 import { breakSealForStop, ownerForcesStop } from './owner.js';
@@ -115,6 +116,37 @@ export const readLog = (name: string): AgentLogEntry[] => {
       }
     });
 };
+
+// ---- reservations ----
+/**
+ * A spend that passed the gate and may be signing right now. Written (under the spend lock) before anything is
+ * signed and counted like a log entry by every process's gate, so parallel spends can't all fit under the cap.
+ * Settled into the log or released afterwards; one left behind by a crashed process stays counted.
+ */
+export type Reservation = AgentLogEntry & { id: string; pid: number };
+const reservedDir = (name: string) => p('reserved', safe(name));
+const reservedFile = (name: string, id: string) => join(reservedDir(name), `${id}.json`);
+export const readReservations = (name: string): Reservation[] => {
+  let files: string[];
+  try {
+    files = readdirSync(reservedDir(name)).filter((f) => f.endsWith('.json'));
+  } catch {
+    return [];
+  }
+  return files.flatMap((f) => {
+    const r = readJson<Reservation>(join(reservedDir(name), f));
+    return r && typeof r.usd === 'number' && typeof r.at === 'number' ? [r] : [];
+  });
+};
+export const addReservation = (name: string, r: Reservation) => {
+  ensure(reservedDir(name));
+  const tmp = `${reservedFile(name, r.id)}.tmp`;
+  writeFileSync(tmp, JSON.stringify(r) + '\n', { mode: 0o600 });
+  renameSync(tmp, reservedFile(name, r.id));
+};
+export const removeReservation = (name: string, id: string) => rmSync(reservedFile(name, id), { force: true });
+/** Is the process that made this reservation still running? (Its spend may still be signing.) */
+export const reservationLive = (r: Reservation) => r.pid === process.pid || pidAlive(r.pid);
 
 // ---- strategy + paper ----
 export const getLoaded = (name: string) => readJson<Loaded>(p('strategies', `${safe(name)}.json`));
