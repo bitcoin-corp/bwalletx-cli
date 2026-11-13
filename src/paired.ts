@@ -189,7 +189,9 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void,
         if (done) return;
         infoId = `info-${Date.now()}`;
         ws.send(JSON.stringify(await sealer.seal({ t: 'req', id: infoId, action: 'info', params: mode === 'brc100' ? { mode } : {} })));
-      } else if (msg.t === 'res' && msg.id === infoId) {
+      } else if (msg.t === 'res' && infoId && msg.id === infoId) {
+        // Only the answer to our own info request, sent after ready (and after a yes, when asked).
+        if (done || (answer && !(await answer))) return;
         if (msg.error) return (ws.close(), reject(new Error(msg.error.message)));
         const i = msg.result as { account: string; identityAddress: string; scopes: string[]; expiresAt: number; mint?: MintInfo | null; caps?: Brc100Caps | null; mode?: string };
         if (mode === 'brc100' && i.mode !== 'brc100') return (ws.close(), reject(new Error('This bWalletX version does not support main-wallet pairing yet (no brc100 mode in its answer).')));
@@ -212,6 +214,7 @@ function round(name: string, mode: 'agent' | 'brc100', out: (s: string) => void,
           sc,
           ...(v2 && { wv: 2 as const }),
         };
+        done = true;
         savePairing(p);
         const cfg = readConfig();
         cfg.accounts[name] = {

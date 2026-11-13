@@ -45,7 +45,8 @@ function startRelay() {
 }
 
 /** What bWalletX does on scan and Pair: hello, ready, then answers the CLI's info request. */
-function fakePhone(link: string) {
+/** `evil`: skip ready and send an unasked-for info answer straight after hello (a stranger who joined first). */
+function fakePhone(link: string, evil = false) {
   const l = parsePairUrl(link);
   const P = PrivateKey.fromRandom();
   const state: { code?: string; closes: string[] } = { closes: [] };
@@ -55,7 +56,8 @@ function fakePhone(link: string) {
     state.code = s.code;
     const sealer = new Sealer(s.key, 'wallet');
     ws.send(JSON.stringify({ t: 'hello', k: P.toPublicKey().toString(), info: { name: 'test', rdns: 'space.bwallet.mobile' } }));
-    ws.send(JSON.stringify(await sealer.seal({ t: 'ready' })));
+    const info = { account: 'Attacker', identityAddress: P.toAddress(), scopes: ['read'], expiresAt: Date.now() + 86_400_000 };
+    ws.send(JSON.stringify(await sealer.seal(evil ? { t: 'res', id: '', result: info } : { t: 'ready' })));
     ws.on('message', async (raw) => {
       const f = JSON.parse(String(raw));
       if (!isSealed(f)) return;
@@ -79,11 +81,11 @@ afterAll(() => {
 });
 
 /** Run login; the phone scans the link as soon as it is printed. */
-function run(name: string, confirmCode: (code: string) => Promise<boolean>) {
+function run(name: string, confirmCode: (code: string) => Promise<boolean>, evil = false) {
   let phone: ReturnType<typeof fakePhone> | undefined;
   const out = (s: string) => {
     const m = /^Or open this link on the phone:\n(\S+)/.exec(s);
-    if (m) phone = fakePhone(m[1]);
+    if (m) phone = fakePhone(m[1], evil);
   };
   return { p: login(name, { relay: relay.host, confirmCode }, out), phone: () => phone! };
 }
@@ -115,5 +117,16 @@ describe('login confirms the code', () => {
     await new Promise((r) => setTimeout(r, 100));
     expect(phone().closes).toEqual(['codes did not match']);
     expect(saved('no')).toBe(false);
+  });
+
+  it('an unasked-for answer saves nothing, before or after a no', async () => {
+    let answer!: (ok: boolean) => void;
+    const { p } = run('evil', () => new Promise<boolean>((r) => (answer = r)), true);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(saved('evil')).toBe(false);
+    answer(false);
+    await expect(p).rejects.toThrow("The codes didn't match");
+    await new Promise((r) => setTimeout(r, 100));
+    expect(saved('evil')).toBe(false);
   });
 });
