@@ -27,13 +27,16 @@ A money fix for `serve`. If an app uses noSend through `bwalletx serve`, or site
   signed in or not. In paired mode it adds the phone's PIN level, `bwalletx-serve-0.6.1; pin=N;`. Older serves
   answered `bwalletx-1.0.0` before pairing and the wallet's own `wallet-brc100-1.0.0` after. A client that relies
   on noSend should refuse anything that isn't `bwalletx-serve-` 0.6.1 or later.
-- **A failed send leaves nothing locked.** If sending fails after every check passed, serve aborts the build
-  (the wallet only allows that while the tx is still unsent and unknown to the network): nothing is paid and the
-  coins come back. If the wallet refuses the abort, the payment may be out: it stays counted and logged. Either
-  way the error names the txid (`txid`, `aborted` in the reply), so a site can check before paying again.
+- **A failed send leaves nothing locked, and is never mistaken for an abort.** If sending fails after every check
+  passed, serve tries once more (the wallet's commit is idempotent, so a send whose answer was lost comes back as
+  a success). If it still fails, serve aborts the build and then asks the wallet's storage: only when storage has
+  no record of the tx, or marks it invalid, does serve say "aborted, nothing paid" and give the budget back. (In
+  action-batch mode the toolbox can report aborted:true for a batch storage already committed, which its monitor
+  then sends.) Otherwise the payment counts as sent and is logged. Either way the error names the txid (`txid`,
+  `aborted` in the reply), so a site can check before paying again.
 - **A site can only abort its own builds** from this serve session. An unknown action may be another app's held
   build, so it is refused. After a serve restart the owner frees a leftover with the new
-  `bwalletx brc100 abort <txid>`.
+  `bwalletx brc100 abort <txid>` (owner PIN, own terminal).
 - **`knownTxids` works again through serve.** serve builds with the full BEEF (it needs the parents to price the
   fee, and the toolbox's batch planner failed on noSend + knownTxids), then trims the reply to what the site
   declared.

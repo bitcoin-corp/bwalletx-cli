@@ -12,7 +12,7 @@ import { createRequire } from 'node:module';
 const dir = mkdtempSync(join(tmpdir(), 'bwx-review-'));
 process.env.BWALLETX_HOME = dir;
 const { writeConfig, readLog } = await import('./store');
-const { serve } = await import('./brc100');
+const { serve, storageTxStatus } = await import('./brc100');
 const { issueToken } = await import('./servePairing');
 const require = createRequire(import.meta.url);
 const sdk = require('@bsv/sdk');
@@ -85,25 +85,25 @@ async function makeWallet(mode?: 'legacy') {
     outputs: [0, 1, 2, 3, 4, 5].map((outputIndex) => ({ outputIndex, protocol: 'wallet payment', paymentRemittance: { derivationPrefix, derivationSuffix, senderIdentityKey: sender.toPublicKey().toString() } })),
     description: 'fund the wallet',
   });
-  return { wallet, knex };
+  return { wallet, knex, active };
 }
 
 let acct = 0;
-const ctl = { throwOnSend: false };
+/** Per send step (a sendWith-only createAction), in order: 'throw' fails it before the wallet sees it, 'pass' lets it through. */
+const ctl = { plan: [] as ('throw' | 'pass')[] };
 async function setup(origins = ['shop.example'], caps: Record<string, number> = { maxUsdPerAction: 100, sessionBudgetUsd: 1000 }, mode?: 'legacy') {
   const account = `r${++acct}`;
   writeConfig({ accounts: { [account]: { name: account, kind: 'paired', identityAddress: '1x', payAddress: '', ordAddress: '', dailyCapUsd: null, stopped: false, importedAt: Date.now() } }, defaultAccount: account } as never);
-  const { wallet, knex } = await makeWallet(mode);
+  const { wallet, knex, active } = await makeWallet(mode);
   const api = wallet as unknown as Record<string, (a: unknown, o?: string) => Promise<unknown>>;
   const call = async (m: string, a: any, site: string) => {
     // Test control: the next send step (a sendWith-only createAction) fails as if storage threw.
-    if (ctl.throwOnSend && m === 'createAction' && a?.options?.sendWith?.length && !a.outputs?.length) {
-      ctl.throwOnSend = false;
-      throw new Error('simulated storage failure on send');
+    if (ctl.plan.length && m === 'createAction' && a?.options?.sendWith?.length && !a.outputs?.length) {
+      if (ctl.plan.shift() === 'throw') throw new Error('simulated storage failure on send');
     }
     return api[m](a, site);
   };
-  const w = { paired: false, call, owned: async () => new Set<string>(), close: async () => undefined };
+  const w = { paired: false, call, owned: async () => new Set<string>(), txStatus: storageTxStatus(wallet), close: async () => undefined };
   const relayed: string[] = [];
   const events: string[] = [];
   const server = await serve(w, { account, origins, port: 0, arc: async (r) => void relayed.push(r.txid), usdPerBsv: async () => 50, onEvent: (l) => events.push(l), ...caps });
@@ -114,7 +114,7 @@ async function setup(origins = ['shop.example'], caps: Record<string, number> = 
   };
   const settle = () => new Promise((r) => setTimeout(r, 50));
   const status = async (txid: string) => ((await knex('transactions').where({ txid }).first()) as { status?: string } | undefined)?.status;
-  return { post, relayed, settle, server, wallet, knex, events, status, account };
+  return { post, relayed, settle, server, wallet, knex, events, status, account, active };
 }
 const dest = new P2PKH().lock(PrivateKey.fromRandom().toAddress()).toHex();
 const pay = (sats: number, options: Record<string, unknown> = {}) => ({ description: 'review payment', outputs: [{ lockingScript: dest, satoshis: sats, outputDescription: 'pay the shop' }], options });
@@ -283,7 +283,7 @@ for (const mode of [undefined, 'legacy'] as const) {
     it('the send step fails: serve aborts the build, the coins come back, the site gets the txid', async () => {
       const s = await setup(undefined, undefined, mode);
       const before = await balance(s.wallet);
-      ctl.throwOnSend = true;
+      ctl.plan = ['throw', 'throw']; // the send step and its one retry
       const r = await s.post('createAction', pay(100_000));
       expect(r.status).toBe(400);
       expect(r.body.aborted, JSON.stringify(r.body)).toBe(true);
@@ -302,6 +302,57 @@ for (const mode of [undefined, 'legacy'] as const) {
       // Still the other app's to send.
       const sent = (await s.wallet.createAction({ description: 'other app sends', options: { sendWith: [other.txid] } }, 'other.app')) as { sendWithResults: { status: string }[] };
       expect(sent.sendWithResults[0].status).not.toBe('failed');
+      s.server.close();
+    });
+
+    // The final review's simulation: storage commits (and shares) the send, then the answer is lost.
+    const loseAnswerAfterCommit = (active: any) => {
+      let armed = true;
+      if (mode === 'legacy') {
+        const orig = active.processAction.bind(active);
+        active.processAction = async (...a: any[]) => {
+          const r = await orig(...a);
+          if (armed && a[1]?.isSendWith && !a[1]?.isNewTx) {
+            armed = false;
+            throw new Error('simulated lost response after processAction');
+          }
+          return r;
+        };
+      } else {
+        const orig = active.updateActionBatch.bind(active);
+        active.updateActionBatch = async (id: unknown, u: any, ...rest: unknown[]) => {
+          const r = await orig(id, u, ...rest);
+          if (armed && u && 'result' in u) {
+            armed = false;
+            throw new Error('simulated lost response after commit');
+          }
+          return r;
+        };
+      }
+    };
+
+    it('committed but the answer was lost: the retry returns the saved result, a normal success', async () => {
+      const s = await setup(undefined, undefined, mode);
+      loseAnswerAfterCommit(s.active);
+      const r = await s.post('createAction', pay(1000));
+      expect(r.status, JSON.stringify(r.body)).toBe(200);
+      await s.settle();
+      expect(s.relayed).toEqual([r.body.txid]);
+      s.server.close();
+    });
+
+    it('committed, answer lost, and the retry fails too: never "aborted, nothing paid"; the charge stays', async () => {
+      const s = await setup(['shop.example'], { maxUsdPerAction: 1, sessionBudgetUsd: 0.6 }, mode);
+      loseAnswerAfterCommit(s.active);
+      ctl.plan = ['pass', 'throw']; // the first send commits then loses its answer; the retry fails outright
+      const r = await s.post('createAction', pay(1_000_000)); // $0.50
+      expect(r.status).toBe(400);
+      expect(r.body.aborted, JSON.stringify(r.body)).toBe(false);
+      expect(String(r.body.message)).toMatch(new RegExp(`check ${r.body.txid} before paying again`));
+      // Storage still has it to send; serve kept the charge and logged it.
+      expect(await storageTxStatus(s.wallet)(r.body.txid)).not.toBe('invalid');
+      expect(readLog(s.account).filter((e: { action: string }) => e.action === 'send')).toHaveLength(1);
+      expect((await s.post('createAction', pay(1_000_000))).status).toBe(400);
       s.server.close();
     });
 

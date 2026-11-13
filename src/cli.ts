@@ -542,6 +542,8 @@ brc
   .option('--shared', "use the account's 1Sat Storage wallet (only if the app uses it as active storage)")
   .action(
     run(async (txid: string, o: { account?: string; shared?: boolean }) => {
+      // The owner, at their own terminal: an agent shell could otherwise abort another app's held payment.
+      await og.requireOwner(`abort held action ${txid}`);
       const { name, w } = await brc100Account(o.account, o.shared);
       try {
         const r = await w.wallet.abortAction({ reference: txid }, 'bwalletx-cli');

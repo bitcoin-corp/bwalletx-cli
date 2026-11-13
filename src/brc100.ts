@@ -472,6 +472,11 @@ export type ServeWallet = {
   call: (method: string, args: unknown, site: string) => Promise<unknown>;
   /** Outpoints ("txid.vout") the wallet itself holds as spendable BSV; inputs naming them are the account's money. */
   owned?: () => Promise<Set<string>>;
+  /**
+   * The wallet STORAGE's record of a tx (its proven_tx_reqs status), or null when storage has none. serve uses it to
+   * check an abort: a client-side batch abort can say aborted:true for a batch storage already committed (13 Nov 2026).
+   */
+  txStatus?: (txid: string) => Promise<string | null>;
   close: () => Promise<void>;
 };
 
@@ -484,8 +489,15 @@ export const localBackend = (w: AgentWallet): ServeWallet => {
       const r = await w.wallet.listOutputs({ basket: 'default', limit: 10_000 }, 'bwalletx-cli');
       return new Set(r.outputs.map((o) => o.outpoint));
     },
+    txStatus: storageTxStatus(w.wallet),
     close: () => w.close(),
   };
+};
+
+/** What the wallet's storage (local SQLite or the remote store) has for a txid: its proven_tx_reqs status, or null. */
+export const storageTxStatus = (wallet: Wallet) => async (txid: string) => {
+  const reqs = (await wallet.storage.findProvenTxReqs({ partial: { txid } })) as { status?: string }[];
+  return reqs[0]?.status ?? null;
 };
 
 /** Phase 1 (read-only) and phase 2 (createAction/signAction: the phone prompts every time). */
@@ -821,8 +833,8 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
     const sw = [...p.sendWith, ...(p.noSend ? [] : [txid])];
     if (sw.length) {
       let sent: ActionResult & { notDelayedResults?: unknown };
-      try {
-        sent = (await w.call(
+      const sendStep = async () =>
+        (await w.call(
           'createAction',
           {
             description: p.description.length >= 5 ? p.description : 'bwalletx serve: send',
@@ -830,8 +842,17 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
           },
           host,
         )) as typeof sent;
-      } catch (e) {
-        throw await sendFailed(e, { call, host, txid, p, logAs, logUsd, ctx });
+      try {
+        sent = await sendStep();
+      } catch (first) {
+        // Once more first: the toolbox's commit is idempotent (an already-committed batch returns its saved result),
+        // so a send that went through but whose answer was lost comes back as a plain success.
+        say(`${host} ${call}: sending ${txid} failed (${(first as Error)?.message ?? first}); trying once more`);
+        try {
+          sent = await sendStep();
+        } catch (e) {
+          throw await sendFailed(e, { call, host, txid, p, logAs, logUsd, ctx });
+        }
       }
       result.sendWithResults = sent.sendWithResults;
       result.notDelayedResults = sent.notDelayedResults;
@@ -862,10 +883,17 @@ export async function serve(input: AgentWallet | ServeWallet, o: ServeOptions) {
         sendWithResults: err?.sendWithResults,
       });
     }
-    const aborted = await w.call('abortAction', { reference: c.txid }, c.host).then(
+    const said = await w.call('abortAction', { reference: c.txid }, c.host).then(
       (r) => (r as { aborted?: unknown } | null)?.aborted === true,
       () => false,
     );
+    // Never take the abort's word alone: in action-batch mode the toolbox aborts its client-side batch and says
+    // aborted:true even when storage already committed it (then its monitor sends it later). Only storage with no
+    // record of the tx, or one marked invalid by a real abort, proves nothing will go out.
+    let stored: string | null | undefined;
+    if (said) stored = w.txStatus ? await w.txStatus(c.txid).catch(() => undefined) : undefined;
+    const aborted = said && (stored === null || stored === 'invalid');
+    if (said && !aborted) say(`${c.host} ${c.call}: the wallet said ${c.txid} was aborted, but storage has it as ${stored ?? 'unknown'}: treating it as sent`);
     if (aborted) {
       release(c.txid);
       c.ctx.committed = false; // runAndRefund gives this call's reservation back

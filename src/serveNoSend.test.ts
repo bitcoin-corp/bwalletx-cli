@@ -46,7 +46,7 @@ function fakeToolbox(failed: Set<string>) {
   const pending = new Map<string, { opts: Opts; t: Transaction; change: number }>();
   const calls: { m: string; args: Args }[] = [];
   /** Test controls: make the next send step (sendWith-only createAction) throw; make abortAction refuse (tx already out). */
-  const ctl = { throwOnSend: false, abortRefuses: false };
+  const ctl = { throwOnSend: 0, abortRefuses: false };
   const statusOf = (txid: string) => (failed.has(txid) || aborted.has(txid) || !built.has(txid) ? 'failed' : 'sending');
   const share = (txids: string[]) => txids.map((txid) => ({ txid, status: statusOf(txid) }));
   const make = (args: Args) => {
@@ -80,8 +80,8 @@ function fakeToolbox(failed: Set<string>) {
     if (m === 'createAction') {
       const isNew = !!(args.outputs?.length || args.inputs?.length) || !opts.sendWith?.length;
       if (!isNew) {
-        if (ctl.throwOnSend) {
-          ctl.throwOnSend = false;
+        if (ctl.throwOnSend > 0) {
+          ctl.throwOnSend--;
           throw new Error('simulated storage failure on send');
         }
         const r = share(opts.sendWith ?? []);
@@ -109,7 +109,9 @@ function fakeToolbox(failed: Set<string>) {
     }
     return {};
   };
-  return { call, calls, built, aborted, sent, ctl };
+  /** What storage would say: invalid once aborted, sending once shared, nosend while held, null if unknown. */
+  const txStatus = async (txid: string) => (aborted.has(txid) ? 'invalid' : sent.has(txid) ? 'sending' : built.has(txid) ? 'nosend' : null);
+  return { call, calls, built, aborted, sent, ctl, txStatus };
 }
 
 const cleanups: (() => unknown)[] = [];
@@ -126,7 +128,7 @@ async function setup(o: { origins?: string[]; serve?: Record<string, unknown>; f
   writeConfig({ accounts: { [account]: { name: account, kind: 'paired', identityAddress: '1x', payAddress: '', ordAddress: '', dailyCapUsd: null, stopped: false, importedAt: Date.now() } }, defaultAccount: account } as never);
   const failed = new Set<string>();
   const fake = o.fake ?? fakeToolbox(failed);
-  const w = { paired: false, call: (m: string, a: unknown) => fake.call(m, a), owned: async () => new Set<string>(), close: async () => undefined };
+  const w = { paired: false, call: (m: string, a: unknown) => fake.call(m, a), owned: async () => new Set<string>(), txStatus: (t: string) => fake.txStatus(t), close: async () => undefined };
   const relayed: { txid: string; tx: number[] }[] = [];
   // $50 per BSV: 1,000,000 sats = $0.50
   const server = await serve(w, { account, origins, port: 0, arc: async (r) => void relayed.push(r), usdPerBsv: async () => 50, ...o.serve });
@@ -412,9 +414,18 @@ describe('knownTxids (13 Nov 2026 re-review)', () => {
 });
 
 describe('a failed send leaves nothing stuck (13 Nov 2026 re-review)', () => {
-  it('the send step throws: serve aborts the build, refunds, names the txid', async () => {
+  it('one failed send step is retried (commit is idempotent): a plain success', async () => {
+    const { post, fake, relayed, settle } = await setup();
+    fake.ctl.throwOnSend = 1;
+    const r = await post('createAction', pay(1000));
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    await settle();
+    expect(txids(relayed)).toEqual([r.body.txid]);
+  });
+
+  it('the send step throws twice: serve aborts the build, refunds, names the txid', async () => {
     const { post, fake, relayed, settle, account } = await setup({ serve: { sessionBudgetUsd: 0.6 } });
-    fake.ctl.throwOnSend = true;
+    fake.ctl.throwOnSend = 2;
     const r = await post('createAction', pay(1_000_000)); // $0.50
     expect(r.status).toBe(400);
     expect(typeof r.body.txid).toBe('string');
@@ -430,7 +441,7 @@ describe('a failed send leaves nothing stuck (13 Nov 2026 re-review)', () => {
 
   it('the send step throws and the wallet refuses the abort (it may be out): txid named, still counted and logged', async () => {
     const { post, fake, account } = await setup({ serve: { sessionBudgetUsd: 0.6 } });
-    fake.ctl.throwOnSend = true;
+    fake.ctl.throwOnSend = 2;
     fake.ctl.abortRefuses = true;
     const r = await post('createAction', pay(1_000_000));
     expect(r.status).toBe(400);
@@ -443,6 +454,18 @@ describe('a failed send leaves nothing stuck (13 Nov 2026 re-review)', () => {
     expect((await post('createAction', pay(1_000_000))).status).toBe(400); // budget still used
     // The site can retry its own build.
     expect((await post('createAction', { description: 'retry the send', options: { sendWith: [r.body.txid] } })).status).toBe(200);
+  });
+  it("an abort the wallet reports but storage doesn't confirm is treated as sent (batch commit raced the abort)", async () => {
+    const { post, fake, account } = await setup({ serve: { sessionBudgetUsd: 0.6 } });
+    fake.ctl.throwOnSend = 2;
+    const realStatus = fake.txStatus;
+    // The abort says aborted:true, but storage still has the tx queued to send (committed before the error).
+    fake.txStatus = async (t: string) => (fake.aborted.has(t) ? 'unsent' : realStatus(t));
+    const r = await post('createAction', pay(1_000_000));
+    expect(r.status).toBe(400);
+    expect(r.body.aborted).toBe(false);
+    expect(readLog(account).filter((e) => e.action === 'send')).toHaveLength(1);
+    expect((await post('createAction', pay(1_000_000))).status).toBe(400); // still charged to the budget
   });
 });
 

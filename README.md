@@ -151,8 +151,8 @@ find it the same way they find BSV Desktop. Built on `@bsv/wallet-toolbox`; keys
   the later `createAction { options: { sendWith: [txid…] } }` sends it (or `abortAction` drops it). A site can
   only `sendWith`, chain on (`noSendChange`), sign or abort builds it made itself in this serve session; a build
   from before a serve restart can't be sent or aborted through serve (the owner frees it with
-  `bwalletx brc100 abort <txid>`). If a send fails, serve aborts the build when the wallet still can (nothing
-  paid, coins back) and the error names the txid either way. The caps count the build, not
+  `bwalletx brc100 abort <txid>`, owner PIN). If a send fails, serve retries once, then aborts the build and
+  says "nothing paid" only when the wallet's storage confirms it; the error names the txid either way. The caps count the build, not
   the `sendWith` call, and an abort gives nothing back (the site already holds the signed tx).
 - **Fees count**: every build is made noSend first and priced from the signed tx. Its network fee counts toward
   the caps below and the daily cap, and must be at most `--max-fee-sats` (default 10,000). A refused build is
