@@ -2,6 +2,9 @@
  * Live signing for standalone mode: plain P2PKH BSV sends with @bsv/sdk against WhatsOnChain UTXOs,
  * broadcast to ARC (GorillaPool) with WhatsOnChain as fallback. Paymail via bsvalias (P2P destinations,
  * then basic paymentDestination). Keys only ever live in memory, decrypted from the key file.
+ *
+ * A paymail host chooses the scripts (and, for P2P, the amounts) it wants paid. Those are checked against what the
+ * person asked to send before anything is signed: see checkPaymentOutputs.
  */
 import { ARC, P2PKH, PrivateKey, SatoshisPerKilobyte, Script, Transaction } from '@bsv/sdk';
 import { getJson, WOC } from './market.js';
@@ -28,7 +31,52 @@ export async function rawTx(txid: string): Promise<string> {
 
 export type Destination = { outputs: { script: string; satoshis: number }[]; p2p?: { url: string; reference: string } };
 
-/** Turn an address or paymail into locking scripts for `sats`. */
+/** At most this many outputs from one paymail host (the bWalletX app's own host returns 1). */
+export const MAX_PAYMAIL_OUTPUTS = 10;
+/** A standard P2PKH locking script: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG. */
+const P2PKH_SCRIPT = /^76a914[0-9a-f]{40}88ac$/;
+const isSats = (n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n > 0;
+
+export class PaymentOutputMismatch extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PaymentOutputMismatch';
+  }
+}
+
+/**
+ * Check outputs a paymail host returned for a payment of `requested` sats, as the bWalletX app does (5.2.41):
+ * 1 to MAX_PAYMAIL_OUTPUTS outputs, each a standard P2PKH script with a whole number of sats above 0, adding up to
+ * exactly `requested`. Returns the outputs (scripts lower-cased) or throws PaymentOutputMismatch, which states the
+ * requested and returned amounts. Nothing is signed before this passes.
+ */
+export function checkPaymentOutputs(to: string, outputs: unknown, requested: number): Destination['outputs'] {
+  const list: unknown[] = Array.isArray(outputs) ? outputs : [];
+  const returned = list.reduce<number>((s, o) => {
+    const v = (o as { satoshis?: unknown } | null)?.satoshis;
+    return typeof v === 'number' && Number.isFinite(v) ? s + v : s;
+  }, 0);
+  const refuse = (why: string) =>
+    new PaymentOutputMismatch(
+      `Payment to ${to} refused: ${why}. Requested ${requested} sats; the paymail host returned ${returned} sats in ${list.length} output${list.length === 1 ? '' : 's'}. Nothing was sent.`,
+    );
+  if (!isSats(requested)) throw refuse('the requested amount is not a whole number of sats above 0');
+  if (!list.length) throw refuse('the paymail host returned no outputs');
+  if (list.length > MAX_PAYMAIL_OUTPUTS) throw refuse(`the paymail host returned more than ${MAX_PAYMAIL_OUTPUTS} outputs`);
+  const checked: Destination['outputs'] = [];
+  for (const o of list) {
+    const { script, satoshis } = (o ?? {}) as { script?: unknown; satoshis?: unknown };
+    if (!isSats(satoshis)) throw refuse('an output has an invalid amount (each must be a whole number of sats above 0)');
+    const hex = typeof script === 'string' ? script.toLowerCase() : '';
+    if (!P2PKH_SCRIPT.test(hex)) throw refuse('an output is not a standard P2PKH script');
+    checked.push({ script: hex, satoshis });
+  }
+  if (returned !== requested)
+    throw refuse(returned > requested ? 'the outputs add up to more than the amount requested' : 'the outputs add up to less than the amount requested');
+  return checked;
+}
+
+/** Turn an address or paymail into locking scripts for `sats`. Paymail outputs are checked (checkPaymentOutputs). */
 export async function resolveDestination(to: string, sats: number, sender: string): Promise<Destination> {
   if (!to.includes('@')) {
     return { outputs: [{ script: new P2PKH().lock(to).toHex(), satoshis: sats }] };
@@ -40,13 +88,15 @@ export async function resolveDestination(to: string, sats: number, sender: strin
   const p2pDest = caps['2a40af698840'];
   const p2pRecv = caps['5f1323cddf31'];
   if (typeof p2pDest === 'string' && typeof p2pRecv === 'string') {
-    const r = await getJson<{ outputs: { script: string; satoshis: number }[]; reference: string }>(fill(p2pDest), 15_000, {
+    const r = await getJson<{ outputs?: unknown; reference?: unknown }>(fill(p2pDest), 15_000, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ satoshis: sats }),
     });
-    if (!r.outputs?.length) throw new Error('Paymail returned no outputs');
-    return { outputs: r.outputs, p2p: { url: fill(p2pRecv), reference: r.reference } };
+    // The host chooses these: never pay them unchecked, and never fall back to another path when they fail the check.
+    const outputs = checkPaymentOutputs(to, r?.outputs, sats);
+    if (typeof r.reference !== 'string' || !r.reference) throw new PaymentOutputMismatch(`Payment to ${to} refused: the paymail host returned no reference. Nothing was sent.`);
+    return { outputs, p2p: { url: fill(p2pRecv), reference: r.reference } };
   }
   const basic = caps.paymentDestination;
   if (typeof basic === 'string') {
@@ -55,8 +105,9 @@ export async function resolveDestination(to: string, sats: number, sender: strin
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ senderHandle: sender, senderName: 'bwalletx-cli', dt: new Date().toISOString(), amount: sats, purpose: 'bwalletx send' }),
     });
-    if (!r.output) throw new Error('Paymail returned no output');
-    return { outputs: [{ script: r.output, satoshis: sats }] };
+    if (!r?.output) throw new Error('Paymail returned no output');
+    // The amount is ours here; the script is the host's, so it gets the same check.
+    return { outputs: checkPaymentOutputs(to, [{ script: r.output, satoshis: sats }], sats) };
   }
   throw new Error(`${domain} doesn't offer a paymail payment destination`);
 }

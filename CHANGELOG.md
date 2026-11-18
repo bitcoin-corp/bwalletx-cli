@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.2
+
+### Security
+
+- security: paymail P2P outputs must match the requested amount. When `send` pays a paymail, the outputs the paymail
+  host returns must add up to exactly the amount you asked to send, each must be a standard P2PKH script with a whole
+  number of satoshis above 0, and there may be at most 10. Otherwise the payment is refused before anything is signed,
+  with an error giving the requested and returned amounts. The script from a basic paymentDestination host gets the
+  same P2PKH check.
+
 ## 0.6.1 (unreleased)
 
 A money fix for `serve`. If an app uses noSend through `bwalletx serve`, or sites can reach your serve, upgrade.

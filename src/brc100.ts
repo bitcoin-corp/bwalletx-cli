@@ -326,7 +326,7 @@ export function txidsToRelay(out: unknown, o: { noSend: boolean }): string[] {
  * The package version, read lazily: the Bun-compiled bNamesX PC miner has no package.json beside it, and reading it
  * at import crashed the miner ('/$bunfs/package.json' ENOENT). Falls back to this constant; a test keeps them equal.
  */
-export const VERSION_FALLBACK = '0.6.1';
+export const VERSION_FALLBACK = '0.6.2';
 let serveVersionCache: string | undefined;
 /** What `getVersion` answers from serve. 0.6.1+ never relays a noSend build and only sends a site's own builds. */
 export function serveVersion(): string {

@@ -38,7 +38,7 @@ import {
   writeConfig,
   type AccountConfig,
 } from './store.js';
-import { addressOf, broadcast, buildSend, notifyP2p, rawTx, resolveDestination, utxos, DEFAULT_SATS_PER_KB } from './wallet.js';
+import { addressOf, broadcast, buildSend, checkPaymentOutputs, notifyP2p, rawTx, resolveDestination, utxos, DEFAULT_SATS_PER_KB } from './wallet.js';
 
 /**
  * A fresh agent account made here (14 Oct 2026, for a second mining machine when Desktop's Add account would not
@@ -167,6 +167,8 @@ async function sendLocked(a: AccountConfig, usd: number, to: string, opts: { pas
     const keys = await unlock(a.name, opts.passphrase);
     const sender = a.identityAddress;
     const dest = await resolveDestination(to, sats, sender);
+    // Belt and braces: whatever resolved the destination, sign only outputs that add up to exactly what was asked.
+    dest.outputs = checkPaymentOutputs(to, dest.outputs, sats);
     const tx = await buildSend(keys.payPk, dest, opts.satsPerKb ?? readConfig().satsPerKb ?? DEFAULT_SATS_PER_KB);
     handedOut = true;
     let txid: string;
