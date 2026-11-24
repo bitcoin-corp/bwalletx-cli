@@ -47,6 +47,8 @@ const row = (tx: Transaction, extra: Row = {}): Row => ({
   ...extra,
 });
 
+const chainUnspent = { isUnspent: async () => true, getTx: async () => ({ vin: [{ txid: 'c'.repeat(64), vout: 0 }] }) };
+
 const MSG_SCRIPT = (op: string) => `The ${op} parameter must be output with valid lockingScript and satoshis.`;
 const MSG_UNSPENDABLE = (op: string) => `The ${op} parameter must be spendable output unless noSend is true.`;
 const MSG_SPENT = (op: string) =>
@@ -69,24 +71,45 @@ describe('repairNodeRow', () => {
     const tx = nodeTx();
     const r = row(tx);
     const db = fakeDb({ outputs: [r], transactions: [{ transactionId: 25327, status: 'completed' }] });
-    expect(await repairNodeRow(db, tx, 0)).toEqual(['spendable']);
+    expect(await repairNodeRow(db, tx, 0, chainUnspent)).toEqual(['spendable']);
     expect(r.spendable).toBe(true);
     expect(r.lockingScript).toBeNull();
   });
 
-  test('a failed tx (on chain, marked failed/invalid in the wallet) also gets its script', async () => {
+  test('a failed tx that is on chain is un-failed like `bwalletx repair` (so the monitor keeps the fix) and gets its script', async () => {
     const tx = nodeTx();
     const r = row(tx, { transactionId: 4214 });
-    const db = fakeDb({ outputs: [r], transactions: [{ transactionId: 4214, status: 'failed' }] });
-    expect((await repairNodeRow(db, tx, 0)).sort()).toEqual(['script', 'spendable']);
+    const parentOut: Row = { outputId: 1, txid: 'c'.repeat(64), vout: 0, spendable: 1, spentBy: null };
+    const t: Row = { transactionId: 4214, status: 'failed' };
+    const req: Row = { txid: tx.id('hex'), status: 'invalid' };
+    const db = fakeDb({ outputs: [r, parentOut], transactions: [t], proven_tx_reqs: [req] });
+    expect((await repairNodeRow(db, tx, 0, chainUnspent)).sort()).toEqual(['script', 'spendable', 'unfailed']);
     expect([...(r.lockingScript as Buffer)]).toEqual(SCRIPT.toBinary());
+    expect([t.status, req.status]).toEqual(['unproven', 'unmined']);
+    expect([parentOut.spendable, parentOut.spentBy]).toEqual([false, 4214]);
+    expect(typeof r.updated_at).toBe('string');
+  });
+
+  test('the chain decides: spent → ["spent"] and nothing changes; unknown (429, error) → nothing changes', async () => {
+    for (const [isUnspent, want] of [
+      [async () => false, ['spent']],
+      [async () => undefined, []],
+      [async () => Promise.reject(new Error('429')), []],
+    ] as const) {
+      const tx = nodeTx();
+      const r = row(tx, { transactionId: 4214 });
+      const t: Row = { transactionId: 4214, status: 'failed' };
+      const db = fakeDb({ outputs: [r], transactions: [t], proven_tx_reqs: [] });
+      expect(await repairNodeRow(db, tx, 0, { isUnspent: isUnspent as never, getTx: chainUnspent.getTx })).toEqual(want);
+      expect([r.spendable, r.lockingScript, t.status]).toEqual([0, null, 'failed']);
+    }
   });
 
   test('no offset: the script is written', async () => {
     const tx = nodeTx();
     const r = row(tx, { scriptLength: null, scriptOffset: null, spendable: 1 });
     const db = fakeDb({ outputs: [r], transactions: [{ transactionId: 25327, status: 'completed' }] });
-    expect(await repairNodeRow(db, tx, 0)).toEqual(['script']);
+    expect(await repairNodeRow(db, tx, 0, chainUnspent)).toEqual(['script']);
   });
 
   test('left alone: spent by one of our actions, change, other satoshis, other script, or no row', async () => {
@@ -100,10 +123,10 @@ describe('repairNodeRow', () => {
       { lockingScript: Buffer.from([0x51]), scriptLength: null },
     ]) {
       const r = row(tx, extra);
-      expect(await repairNodeRow(fakeDb(tables(r)), tx, 0)).toEqual([]);
+      expect(await repairNodeRow(fakeDb(tables(r)), tx, 0, chainUnspent)).toEqual([]);
       expect(r.spendable).toBe(0);
     }
-    expect(await repairNodeRow(fakeDb({ outputs: [], transactions: [] }), tx, 0)).toEqual([]);
+    expect(await repairNodeRow(fakeDb({ outputs: [], transactions: [] }), tx, 0, chainUnspent)).toEqual([]);
   });
 });
 
@@ -183,6 +206,29 @@ describe('mineName on a refused stored row', () => {
     }
   });
 
+  test('the chain says the node is spent: the normal double-spend path (marked spent), not the stored-row error', async () => {
+    const tree = new OpnsTree(memKV(), 'k');
+    const run = mineName(
+      {
+        ctx: {} as never,
+        fetch,
+        tree,
+        load: load as never,
+        mineChar: instantMiner,
+        mint: (async () => {
+          throw new Error(MSG_SPENT(HE));
+        }) as never,
+        fixNodeRow: async () => ['spent'],
+      },
+      'hej',
+      new AbortController().signal,
+      () => undefined,
+    );
+    await expect(run).rejects.toThrow(/catching up/);
+    await expect(run).rejects.not.toBeInstanceOf(StoredNodeRowError);
+    expect(tree.isSpent(HE)).toBe(true);
+  });
+
   test('still refused after the repair: the clear error, one retry only', async () => {
     let mints = 0;
     const run = mineName(
@@ -203,5 +249,15 @@ describe('mineName on a refused stored row', () => {
     );
     await expect(run).rejects.toBeInstanceOf(StoredNodeRowError);
     expect(mints).toBe(2);
+  });
+});
+
+describe('batch isTransient vs a txid in the message', () => {
+  test('status codes only as whole numbers: a txid containing 429 or 503 is not a network error', async () => {
+    const { isTransient } = await import('./batch.js');
+    const op = `${'0'.repeat(20)}4290${'0'.repeat(20)}503${'0'.repeat(20)}.0`;
+    expect(isTransient(new StoredNodeRowError(op, new Error(MSG_SPENT(op))).message)).toBe(false);
+    expect(isTransient('HTTP 429 Too Many Requests')).toBe(true);
+    expect(isTransient('503 Service Unavailable')).toBe(true);
   });
 });

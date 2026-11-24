@@ -394,8 +394,14 @@ export const mineName = async (
         const fixed = deps.fixNodeRow ? await deps.fixNodeRow(node).catch(() => [] as NodeRowFix[]) : [];
         deps.log?.(
           `Wallet refused name-tree node ${node.outpoint}: ${e instanceof Error ? e.message : String(e)}` +
-            (fixed.length ? ` (repaired its stored row: ${fixed.join(', ')}; retrying)` : ''),
+            (fixed.includes('spent')
+              ? ' (spent on chain)'
+              : fixed.length
+                ? ` (repaired its stored row: ${fixed.join(', ')}; retrying)`
+                : ''),
         );
+        // Spent on chain: a real double spend after all, handled below like any other.
+        if (fixed.includes('spent')) throw new Error(`Name-tree node ${node.outpoint} is already spent on chain`);
         if (!fixed.length) throw new StoredNodeRowError(node.outpoint, e);
         try {
           step = await mint(deps.ctx, node, char, nonce, hash, lockTo);
