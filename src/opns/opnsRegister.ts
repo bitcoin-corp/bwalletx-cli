@@ -18,6 +18,7 @@ import {
   type MintStepResult,
 } from './opnsMint.js';
 import type { OpnsTree } from './opnsTree.js';
+import { isStoredInputRejection, StoredNodeRowError, type NodeRowFix } from './nodeRow.js';
 
 /**
  * Register a brand-new OpNS name: mine it character by character on-device, one mint
@@ -78,6 +79,8 @@ export type RegisterDeps = {
   lockTo?: (newDomain: string) => string | undefined;
   /** CLI: one-line notes about what the minter is doing (ghost nodes dropped, …). */
   log?: (msg: string) => void;
+  /** CLI: repair the wallet's own stored row for a node after createAction refused it (see nodeRow.ts). */
+  fixNodeRow?: (node: LoadedNode) => Promise<NodeRowFix[]>;
   now?: () => number;
 };
 
@@ -380,10 +383,29 @@ export const mineName = async (
 
     onProgress({ phase: 'broadcasting', domain, charIndex, charsTotal: totalChars, tried: 0, rate: 0, etaSeconds: 0 });
     let step: MintStepResult;
+    const lockTo = deps.lockTo?.(domain + String.fromCharCode(char));
     try {
-      step = await mint(deps.ctx, node, char, nonce, hash, deps.lockTo?.(domain + String.fromCharCode(char)));
+      try {
+        step = await mint(deps.ctx, node, char, nonce, hash, lockTo);
+      } catch (e) {
+        // The wallet refused its OWN stored row for the node (24 Nov 2026, "he*"): not a spend, not the chain lagging.
+        // Repair the row and try the same mint once more (the PoW is still good for this node).
+        if (!isStoredInputRejection(e)) throw e;
+        const fixed = deps.fixNodeRow ? await deps.fixNodeRow(node).catch(() => [] as NodeRowFix[]) : [];
+        deps.log?.(
+          `Wallet refused name-tree node ${node.outpoint}: ${e instanceof Error ? e.message : String(e)}` +
+            (fixed.length ? ` (repaired its stored row: ${fixed.join(', ')}; retrying)` : ''),
+        );
+        if (!fixed.length) throw new StoredNodeRowError(node.outpoint, e);
+        try {
+          step = await mint(deps.ctx, node, char, nonce, hash, lockTo);
+        } catch (e2) {
+          if (isStoredInputRejection(e2)) throw new StoredNodeRowError(node.outpoint, e2);
+          throw e2;
+        }
+      }
     } catch (e) {
-      if (!isDoubleSpend(e)) throw e;
+      if (e instanceof StoredNodeRowError || !isDoubleSpend(e)) throw e;
       // That node is gone (spent by someone, maybe our own unconfirmed mint): never try it again.
       tree?.markSpent(node.outpoint);
       if (await isTaken(deps.fetch, name)) throw new NameTakenError(name);

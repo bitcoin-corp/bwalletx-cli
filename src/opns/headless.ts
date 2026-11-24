@@ -26,7 +26,8 @@ import {
   type State,
 } from './batch.js';
 import { benchmark, getThreads, setThreads } from './miner.js';
-import { estimateMintFee, fetchMineNode } from './opnsMint.js';
+import { estimateMintFee, fetchMineNode, type LoadedNode } from './opnsMint.js';
+import { repairNodeRow } from './nodeRow.js';
 import { mineName, type Progress } from './opnsRegister.js';
 import { appendLedger, ledgerNames, ownerCheck } from './opnsOwner.js';
 import { fileKV, OpnsTree } from './opnsTree.js';
@@ -178,6 +179,9 @@ export const syncFirst = async (w: Pick<AgentWallet, 'syncProofs'>, log: (l: str
   }
 };
 
+/** Stored-row repair for mineName when the wallet's storage is local SQLite (a remote store can't be patched here). */
+const fixNodeRowFor = (db: AgentWallet['db']) => (db ? (n: LoadedNode) => repairNodeRow(db, n.tx, n.vout) : undefined);
+
 /** For retryOnBeefDepth: sync proofs (errors swallowed; the retry reports the real failure). */
 const syncer = (w: Pick<AgentWallet, 'syncProofs'>) => (w.syncProofs ? () => w.syncProofs!().catch(() => undefined) : undefined);
 
@@ -282,7 +286,8 @@ export async function opnsMint(o: MintOptions): Promise<RunResult> {
     const res = await runHeadless(
       {
         fetch: f,
-        mine: (n, lockTo, signal, onProgress) => mineName({ ctx, fetch: f, tree, lockTo, log }, n, signal, onProgress),
+        mine: (n, lockTo, signal, onProgress) =>
+          mineName({ ctx, fetch: f, tree, lockTo, log, fixNodeRow: fixNodeRowFor(w.db) }, n, signal, onProgress),
         log,
         repairProofs: w.repairProofs,
         list: async (n, sats) => {
