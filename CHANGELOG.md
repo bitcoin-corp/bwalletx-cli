@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.3
+
+### OpNS miner
+
+- **No more endless "still catching up" on names below one of our own nodes.** When a mint spends a node that an
+  earlier mint of ours created, the wallet uses its own stored copy of that output. Some of those copies were marked
+  unspendable although nothing spent them (and, for a mint the wallet wrongly recorded as failed, had no script it
+  could read). The wallet refused the input, the miner took that for a double spend, marked the node spent, and the
+  name waited for confirmations that were never coming: every "he…" name looped from 26 Oct to 24 Nov 2026, about
+  200 failed mints of ~30 minutes of work each.
+  - On that refusal the miner asks WhatsOnChain whether the node is unspent. If it is, it repairs the stored row from
+    the node transaction it already loaded (spendable, and the script and satoshis only when the wallet can't produce
+    them; a mint the wallet wrongly recorded as failed is un-failed the way `bwalletx repair` does it) and retries the
+    same mint once, without redoing the proof of work. If the chain says spent, it is handled as the double spend it
+    is.
+  - A txid in an error message no longer reads as an HTTP 429/50x, so such a name isn't retried as a network error.
+  - If the row can't be repaired (or the wallet storage isn't local), the name fails straight away with the wallet's
+    real message and a pointer to `bwalletx repair`, never "catching up", and the node is not marked spent.
+
 ## 0.6.2
 
 ### Security

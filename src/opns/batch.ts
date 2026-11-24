@@ -299,7 +299,7 @@ export const isRetryableListError = (msg: string) =>
 // "must be valid transaction on chain" / "not found": a parent we just broadcast has not reached that provider yet
 // (13 Oct 2026: it stopped the run on bitcoin3d although the txid was on chain minutes later).
 export const isTransient = (msg: string) =>
-  /fetch failed|timeout|timed out|ECONN|ENOTFOUND|EAI_AGAIN|socket|429|50[234]|must be valid transaction|not found|unknown tx|bad gateway|unavailable|rate limit|still catching up/i.test(
+  /fetch failed|timeout|timed out|ECONN|ENOTFOUND|EAI_AGAIN|socket|\b(?:429|50[234])\b|must be valid transaction|not found|unknown tx|bad gateway|unavailable|rate limit|still catching up/i.test(
     msg,
   );
 

@@ -5,6 +5,7 @@ import { OPNS_BASKET, P1SAT_PROTOCOL } from '@1sat/types';
 import { buildOrdinalCustomInstructions, executeTrackedAction, type OneSatContext } from '@1sat/actions';
 import { Beef, P2PKH, PublicKey, Script, Spend, Transaction, Utils, type CreateActionArgs } from '@bsv/sdk';
 import { SERVICES, type Fetch } from './services.js';
+import { isStoredInputRejection } from './nodeRow.js';
 
 /**
  * OpNS mint: one transaction per character, following the covenant's fixed layout
@@ -299,7 +300,9 @@ export const mintStep = async (
   } catch (e) {
     // A rejected broadcast (e.g. WERR_REVIEW_ACTIONS on a double-spent node) must not leave a reservation behind.
     // A failed signAction (e.g. an unlock longer than reserved) carries no reference, so use the one createAction returned.
-    await abortFailedAction(ctx, e, tracked.seen.reference);
+    // A stored-row refusal comes before createAction returns (the toolbox fails its own action), and its message
+    // carries the NODE's txid, which failedActionRef would pick up and abort our own parent mint with.
+    if (!isStoredInputRejection(e)) await abortFailedAction(ctx, e, tracked.seen.reference);
     throw e;
   }
   if ('error' in res && res.error) throw new Error(String(res.error));
