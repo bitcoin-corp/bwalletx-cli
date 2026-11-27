@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.4
+
+### Pairing (needed before 30 Nov 2026)
+
+- **Pairing sends relay claims.** `bwalletx login` opens its channel with a site claim and the digest of the QR-bound
+  wallet claim, and every connect sends the saved claim (pairings saved before this get one on their next connect).
+  From 30 Nov 2026 the pairing relay refuses a CLI that sends no claim, so paired CLIs need this version. With a phone
+  on wallet claim v2 the pairing re-binds the phone's role on every connect with a claim only the phone and the CLI can
+  compute; an older pairing upgrades the next time the phone names its claim.
+- **You confirm the pairing code.** A pairing finishes only after the phone's Pair and a yes to "Does your phone show
+  the code …?" in your terminal. `bwalletx login` needs a terminal for that.
+- **A smaller terminal QR** (a compact pairing code; `--full-qr` for bWalletX older than 5.2.56), `--qr solid` for
+  terminals that space lines apart, and `--open-qr` to open it as an image.
+- **New: `bwalletx ping`** checks a paired account: is the pairing service reachable, is the phone connected, does it
+  answer?
+
 ## 0.6.3
 
 ### OpNS miner
