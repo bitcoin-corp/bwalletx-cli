@@ -8,7 +8,7 @@
  *   frame:  { s: seq, n: nonce b64, d: ciphertext b64 }, AAD = "<sender role>|<s>", s strictly increasing
  *   code:   first 2 bytes of SHA-256(key bits) → 4 digits, shown on both screens
  */
-import { PrivateKey, PublicKey } from '@bsv/sdk';
+import { Hash, PrivateKey, PublicKey, Utils } from '@bsv/sdk';
 import { webcrypto } from 'node:crypto';
 const crypto = (globalThis.crypto ?? webcrypto) as Crypto;
 
@@ -29,13 +29,18 @@ export type PairLink = { v: string; r: string; c: string; k: string; o: string; 
 export type PairMessage =
   | { t: 'req'; id: string; action: string; params: unknown }
   | { t: 'res'; id: string; result?: unknown; error?: { code: string; message: string } }
-  | { t: 'ready' }
+  /**
+   * `wcv: 2` + `nc`: the phone's session claim digest. The CLI checks it against its own derivation, saves `wv: 2` and
+   * sends it as `wc` on later connects (that is also how a pairing that started as v1 upgrades).
+   */
+  | { t: 'ready'; wcv?: 2; nc?: string }
   | { t: 'ping' }
   | { t: 'close'; reason: string };
 
 /** Unencrypted frames: from the relay, and the phone's hello (its key isn't shared yet). */
-export type RelayFrame = { t: 'relay'; verifiedOrigin?: string; peer?: 'joined' | 'left'; role?: Role; error?: string };
-export type HelloFrame = { t: 'hello'; k: string; info: WalletInfo };
+export type RelayFrame = { t: 'relay'; verifiedOrigin?: string; peer?: 'joined' | 'left'; role?: Role; error?: string; wcv?: number };
+/** `wcv: 2`: the relay holds the wallet role for this pairing's session claim; the CLI re-binds it on every connect. */
+export type HelloFrame = { t: 'hello'; k: string; info: WalletInfo; wcv?: 2 };
 export type SealedFrame = { s: number; n: string; d: string };
 
 const enc = new TextEncoder();
@@ -64,6 +69,26 @@ export function pairUrl(link: PairLink): string {
   return `https://${PAIR_HOST}/pair?${q}`;
 }
 
+/**
+ * The compact pairing code for the terminal QR (owner, 13 Nov 2026): `BWX1:<channel>:<key>`, RFC 4648 base32 without
+ * padding, so the QR is alphanumeric and 33 modules instead of 49. bWalletX (pair/protocol.ts expandCompactPair, 5.2.56+)
+ * implies the default relay, the CLI origin and the usual lifetime. Shared test vector with the wallet.
+ */
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+export const base32 = (bytes: Uint8Array) => {
+  let out = '';
+  let acc = 0;
+  let bits = 0;
+  for (const b of bytes) {
+    acc = ((acc << 8) | b) & 0xffff;
+    bits += 8;
+    while (bits >= 5) out += B32[(acc >>> (bits -= 5)) & 31];
+  }
+  return bits ? out + B32[(acc << (5 - bits)) & 31] : out;
+};
+export const compactPairCode = (channel: string, sitePubHex: string) =>
+  `BWX1:${base32(fromB64url(channel))}:${base32(Uint8Array.from(Buffer.from(sitePubHex, 'hex')))}`;
+
 /** Parse a scanned QR (https link or bwallet:// fallback). Throws on anything else. */
 export function parsePairUrl(text: string, nowS = Math.floor(Date.now() / 1000)): PairLink {
   const u = new URL(text.trim());
@@ -83,10 +108,54 @@ export function parsePairUrl(text: string, nowS = Math.floor(Date.now() / 1000))
   return link;
 }
 
-export const relaySocketUrl = (relay: string, channel: string, role: Role, expiry?: number) => {
+/** A fresh relay role claim (16 random bytes): the relay then admits this role only with the same claim. */
+export const newClaim = () => b64url(crypto.getRandomValues(new Uint8Array(16)));
+export const CLAIM_FORMAT = /^[A-Za-z0-9_-]{22,64}$/;
+
+const WALLET_CLAIM_INFO = 'bwallet-pair-wallet-claim-v1';
+const SESSION_CLAIM_INFO = 'bwallet-pair-wallet-claim-v2';
+
+/**
+ * The wallet's relay claim for a fresh QR: SHA-256 of the channel and the site's pairing key, both in the QR. The CLI
+ * sends its digest (`wc`) when it opens the channel, so someone who only knows the channel ID can't take the wallet
+ * role. Anyone who sees the QR can compute it, so the relay accepts it for the first wallet join only (wallet claim v2).
+ * Same bytes as bWalletX and @bwalletx/connect.
+ */
+export function walletClaimFor(channel: string, sitePub: string): string {
+  return b64url(new Uint8Array(Hash.sha256(Utils.toArray(`${WALLET_CLAIM_INFO}|${channel}|${sitePub}`, 'utf8'))));
+}
+
+/**
+ * Wallet claim v2: the wallet's relay claim for the life of a pairing. HMAC-SHA256 keyed by the ECDH point of the two
+ * pairing keys (compressed), over "bwallet-pair-wallet-claim-v2|<channel>". Only the phone (its pairing key + the QR's
+ * key) and the CLI (its pairing key + the phone's hello) can compute it.
+ */
+export function sessionWalletClaim(mine: PrivateKey, theirs: string, channel: string): string {
+  const point = mine.deriveSharedSecret(PublicKey.fromString(theirs)).encode(true) as number[];
+  return b64url(new Uint8Array(Hash.sha256hmac(point, Utils.toArray(`${SESSION_CLAIM_INFO}|${channel}`, 'utf8'))));
+}
+
+/** SHA-256 (hex) of a claim: what the relay stores and what a site sends as `wc`. */
+export const claimDigest = (claim: string): string => Utils.toHex(Hash.sha256(Utils.toArray(claim, 'utf8')));
+
+/**
+ * The relay socket URL. `claim` binds the role to this client (a site sends one on every connect; after 30 Nov 2026
+ * the relay refuses a site without one). `walletClaimHash` is `wc` on a site socket: the QR-bound wallet claim's digest
+ * when opening a channel, or the session claim's digest when reconnecting a v2 pairing. On a wallet socket it is `nc`.
+ */
+export const relaySocketUrl = (
+  relay: string,
+  channel: string,
+  role: Role,
+  expiry?: number,
+  claim?: string,
+  walletClaimHash?: string,
+) => {
   const local = /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(relay);
   const q = new URLSearchParams({ role });
   if (expiry) q.set('e', String(expiry));
+  if (claim) q.set('claim', claim);
+  if (walletClaimHash) q.set(role === 'site' ? 'wc' : 'nc', walletClaimHash);
   return `${local ? 'ws' : 'wss'}://${relay}/v1/c/${channel}?${q}`;
 };
 
